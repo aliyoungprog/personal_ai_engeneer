@@ -1,0 +1,13 @@
+services:
+  ai-agent:
+    build: .
+    container_name: ai-agent
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./worktrees:/app/worktrees
+      - ./repos:/app/repos
+    mem_limit: 1g
+    cpus: 1.0
+    stop_grace_period: 10s
