@@ -1,13 +1,36 @@
 services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: ai-agent-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent
+      POSTGRES_DB: agent
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   ai-agent:
     build: .
     container_name: ai-agent
     restart: unless-stopped
     env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
-      - ./data:/app/data
       - ./worktrees:/app/worktrees
       - ./repos:/app/repos
     mem_limit: 1g
     cpus: 1.0
     stop_grace_period: 10s
+
+volumes:
+  pgdata:

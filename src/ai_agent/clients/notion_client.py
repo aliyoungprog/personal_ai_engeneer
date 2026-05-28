@@ -1,26 +1,15 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
 from typing import Any
 
-import structlog
+from loguru import logger
 from notion_client import AsyncClient
 
-log = structlog.get_logger()
+from ai_agent.errors import NotionError
+from ai_agent.schemas import NotionTaskDTO
 
 
-@dataclass(slots=True)
-class NotionTask:
-    page_id: str
-    task_id: int | None
-    title: str
-    project: str | None
-    status: str | None
-    url: str
-    raw: dict[str, Any]
+class NotionClient:
+    """Thin wrapper around `notion_client.AsyncClient` exposing only what we need."""
 
-
-class NotionPoller:
     def __init__(
         self,
         token: str,
@@ -36,6 +25,9 @@ class NotionPoller:
         self._statuses = statuses
         self._user_id: str | None = None
 
+    async def close(self) -> None:
+        await self._client.aclose()
+
     async def resolve_user_id(self) -> str:
         if self._user_id is not None:
             return self._user_id
@@ -48,26 +40,26 @@ class NotionPoller:
             for user in resp.get("results", []):
                 if user.get("name") == self._assignee_name:
                     self._user_id = user["id"]
-                    log.info("notion.user_resolved", name=self._assignee_name, id=self._user_id)
+                    logger.info(
+                        "notion.user_resolved name={name} id={uid}",
+                        name=self._assignee_name,
+                        uid=self._user_id,
+                    )
                     return self._user_id
             if not resp.get("has_more"):
                 break
             cursor = resp.get("next_cursor")
-        raise RuntimeError(
-            f"Notion user '{self._assignee_name}' not found. "
-            "Make sure the integration is shared with the workspace and has user-read permission."
+        raise NotionError(
+            "Notion user not found",
+            details={"name": self._assignee_name},
         )
 
     def _build_filter(self, user_id: str) -> dict[str, Any]:
         project_or = {
-            "or": [
-                {"property": "Project", "select": {"equals": p}} for p in self._projects
-            ]
+            "or": [{"property": "Project", "select": {"equals": p}} for p in self._projects]
         }
         status_or = {
-            "or": [
-                {"property": "Status", "status": {"equals": s}} for s in self._statuses
-            ]
+            "or": [{"property": "Status", "status": {"equals": s}} for s in self._statuses]
         }
         return {
             "and": [
@@ -77,16 +69,13 @@ class NotionPoller:
             ]
         }
 
-    async def fetch_tasks(self) -> list[NotionTask]:
+    async def fetch_tasks(self) -> list[NotionTaskDTO]:
         user_id = await self.resolve_user_id()
         filter_obj = self._build_filter(user_id)
-        tasks: list[NotionTask] = []
+        results: list[NotionTaskDTO] = []
         cursor: str | None = None
         while True:
-            params: dict[str, Any] = {
-                "filter": filter_obj,
-                "page_size": 100,
-            }
+            params: dict[str, Any] = {"filter": filter_obj, "page_size": 100}
             if cursor:
                 params["start_cursor"] = cursor
             resp = await self._client.data_sources.query(
@@ -94,28 +83,21 @@ class NotionPoller:
                 **params,
             )
             for page in resp.get("results", []):
-                tasks.append(_parse_page(page))
+                results.append(_parse_page(page))
             if not resp.get("has_more"):
                 break
             cursor = resp.get("next_cursor")
-        return tasks
-
-    async def close(self) -> None:
-        await self._client.aclose()
+        return results
 
 
-def _parse_page(page: dict[str, Any]) -> NotionTask:
+def _parse_page(page: dict[str, Any]) -> NotionTaskDTO:
     props = page.get("properties", {})
-    title = _get_title(props.get("Task Name"))
-    project = _get_select(props.get("Project"))
-    status = _get_status(props.get("Status"))
-    task_id = _get_number(props.get("ID"))
-    return NotionTask(
+    return NotionTaskDTO(
         page_id=page["id"],
-        task_id=task_id,
-        title=title or "(untitled)",
-        project=project,
-        status=status,
+        task_id=_get_number(props.get("ID")),
+        title=_get_title(props.get("Task Name")) or "(untitled)",
+        project=_get_select(props.get("Project")),
+        status=_get_status(props.get("Status")),
         url=page.get("url", ""),
         raw=page,
     )
@@ -147,10 +129,7 @@ def _get_number(prop: dict[str, Any] | None) -> int | None:
         return None
     t = prop.get("type")
     if t == "unique_id":
-        uid = prop.get("unique_id", {})
-        return uid.get("number")
+        return prop.get("unique_id", {}).get("number")
     if t == "number":
         return prop.get("number")
     return None
-
-

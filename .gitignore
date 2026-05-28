@@ -5,11 +5,9 @@ __pycache__/
 venv/
 .env
 .env.local
-*.db
-*.db-journal
-data/
 worktrees/
 repos/
+.idea/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/

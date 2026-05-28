@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     gitlab_project_path: str = "freedom-ai/platform/ai-agents-platform"
 
     poll_interval_seconds: int = 300
-    database_path: str = "/app/data/state.db"
+    database_url: str = "postgres://agent:agent@postgres:5432/agent"
     log_level: str = "INFO"
 
     @property

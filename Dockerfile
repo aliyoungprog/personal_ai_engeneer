@@ -18,16 +18,19 @@ RUN groupadd --gid 1000 agent && useradd --uid 1000 --gid 1000 --create-home --s
 
 WORKDIR /app
 
-COPY pyproject.toml ./
-RUN uv sync --no-install-project --no-dev
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-install-project --no-dev
 
 COPY src ./src
-RUN uv sync --no-dev
+COPY migrations ./migrations
+COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+RUN uv sync --frozen --no-dev
 
-RUN mkdir -p /app/data /app/worktrees /app/repos && chown -R agent:agent /app /opt/venv
+RUN mkdir -p /app/worktrees /app/repos && chown -R agent:agent /app /opt/venv
 
 USER agent
 
 ENV PATH="/opt/venv/bin:${PATH}"
 
-CMD ["python", "-m", "ai_agent.main"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

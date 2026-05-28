@@ -3,23 +3,10 @@ name = "ai-agent-bot"
 version = "0.1.0"
 description = "Autonomous coding agent: Notion tasks -> Claude Code -> GitLab MRs, controlled via Telegram"
 requires-python = ">=3.12"
-dependencies = [
-    "aiogram>=3.13",
-    "notion-client>=2.2",
-    "python-gitlab>=4.10",
-    "pydantic-settings>=2.5",
-    "aiosqlite>=0.20",
-    "structlog>=24.4",
-    "httpx>=0.27",
-]
+dependencies = ["aiogram>=3.13", "notion-client>=3.0", "python-gitlab>=4.10", "pydantic>=2.9", "pydantic-settings>=2.5", "tortoise-orm[asyncpg]>=0.22", "aerich>=0.8", "tomlkit>=0.13", "dependency-injector>=4.42", "loguru>=0.7", "httpx>=0.27"]
 
 [dependency-groups]
-dev = [
-    "ruff>=0.7",
-    "mypy>=1.13",
-    "pytest>=8.3",
-    "pytest-asyncio>=0.24",
-]
+dev = ["ruff>=0.7", "mypy>=1.13", "pytest>=8.3", "pytest-asyncio>=0.24"]
 
 [tool.ruff]
 line-length = 100
@@ -37,9 +24,14 @@ warn_return_any = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+[tool.aerich]
+tortoise_orm = "ai_agent.database.tortoise_config"
+location = "./migrations"
+src_folder = "./src"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ai_agent"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
