@@ -26,6 +26,7 @@ services:
       postgres:
         condition: service_healthy
     volumes:
+      - claude-auth:/home/agent/.claude
       - ./worktrees:/app/worktrees
       - ./repos:/app/repos
     mem_limit: 1g
@@ -34,3 +35,4 @@ services:
 
 volumes:
   pgdata:
+  claude-auth:
