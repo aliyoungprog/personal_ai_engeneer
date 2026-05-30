@@ -55,14 +55,37 @@ def register_handlers(
     async def on_list(msg: Message) -> None:
         if not _allowed(msg):
             return
-        pending = await tasks_repository.list_by_decision(TaskDecision.PENDING)
-        if not pending:
-            await msg.answer("Нет тасок ожидающих решения.")
+        group_order = (
+            ("pending", "⏳ Pending"),
+            ("accepted", "▶️ Accepted"),
+            ("deferred", "⏰ Deferred"),
+            ("skipped", "⏭ Skipped"),
+        )
+        groups: dict[str, list] = {}
+        for decision_value, _label in group_order:
+            groups[decision_value] = await tasks_repository.list_by_decision(
+                TaskDecision(decision_value)
+            )
+        total = sum(len(v) for v in groups.values())
+        if total == 0:
+            await msg.answer("Список пуст.")
             return
-        lines = [f"📋 <b>Pending tasks ({len(pending)}):</b>"]
-        for t in pending[:20]:
-            tid = f"T-{t.notion_task_id}" if t.notion_task_id else "?"
-            lines.append(f"• <b>{tid}</b> [{escape(t.status or '?')}] {escape(t.title)}")
+
+        per_group_limit = 20
+        lines: list[str] = [f"📋 <b>Tasks ({total}):</b>"]
+        for decision_value, label in group_order:
+            items = groups[decision_value]
+            if not items:
+                continue
+            lines.append("")
+            lines.append(f"<b>{label} — {len(items)}</b>")
+            for t in items[:per_group_limit]:
+                tid = f"T-{t.notion_task_id}" if t.notion_task_id else "?"
+                lines.append(
+                    f"• <b>{tid}</b> [{escape(t.status or '?')}] {escape(t.title)}"
+                )
+            if len(items) > per_group_limit:
+                lines.append(f"  …и ещё {len(items) - per_group_limit}")
         await msg.answer("\n".join(lines), parse_mode="HTML")
 
     @dp.callback_query(F.data.startswith("task:"))
