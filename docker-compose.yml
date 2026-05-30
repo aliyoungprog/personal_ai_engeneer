@@ -29,8 +29,10 @@ services:
       - claude-auth:/home/agent/.claude
       - ./worktrees:/app/worktrees
       - ./repos:/app/repos
-    mem_limit: 1g
-    cpus: 1.0
+    # Claude Code is a Node process that, on a real coding task with repo
+    # context, needs well over 1G. 1g caused OOM-kills (exit 137) mid-run.
+    mem_limit: 4g
+    cpus: 2.0
     stop_grace_period: 10s
 
 volumes:

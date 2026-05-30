@@ -54,7 +54,7 @@ async def main() -> None:
     )
     worktree = WorktreeManager(repo, Path("/app/worktrees"))
     runner = ClaudeRunner()
-    reviewer = ReviewerAgent(runner)
+    reviewer = ReviewerAgent(runner, model=settings.reviewer_model)
 
     banner("STAGE 1/5  PREPARING — clone + worktree")
     await repo.ensure_cloned()
@@ -74,7 +74,12 @@ async def main() -> None:
             "- Reply with a one-line summary when done."
         )
         coding = await runner.run(
-            ClaudeRunRequest(cwd=handle.path, prompt=prompt, timeout_seconds=900),
+            ClaudeRunRequest(
+                cwd=handle.path,
+                prompt=prompt,
+                model=settings.coder_model,
+                timeout_seconds=900,
+            ),
         )
         print(f"success: {coding.success}  duration: {coding.duration_seconds:.1f}s")
         print(f"summary: {coding.final_message}")

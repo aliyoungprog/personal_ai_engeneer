@@ -11,7 +11,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from time import monotonic
+from time import monotonic, time
 from typing import Any, Literal
 
 from loguru import logger
@@ -59,6 +59,12 @@ class ClaudeRunRequest(BaseModel):
     disallowed_tools: tuple[str, ...] = DEFAULT_DISALLOWED_TOOLS
     permission_mode: PermissionMode = "acceptEdits"
     timeout_seconds: int = 1800
+    # If no stream event arrives for this long, assume the CLI is stalled
+    # (silently waiting on a rate-limit window) and bail out.
+    inactivity_timeout_seconds: int = 300
+    # If a blocking rate-limit event says the window resets more than this many
+    # seconds away, bail immediately instead of waiting.
+    rate_limit_wait_threshold_seconds: int = 60
     extra_args: tuple[str, ...] = ()
 
 
@@ -70,10 +76,18 @@ class ClaudeRunResult(BaseModel):
     exit_code: int | None
     events: list[dict[str, Any]]
     stderr: str
+    rate_limited: bool = False
+    rate_limit_resets_at: int | None = None  # unix epoch seconds
 
     @property
     def event_count(self) -> int:
         return len(self.events)
+
+
+def _rate_limit_blocking(info: dict[str, Any]) -> bool:
+    """A rate_limit_event blocks progress when the window is no longer 'allowed'."""
+
+    return info.get("status") not in (None, "allowed")
 
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
@@ -116,12 +130,16 @@ class ClaudeRunner:
 
         events: list[dict[str, Any]] = []
         result_event: dict[str, Any] | None = None
+        last_rate_limit: dict[str, Any] | None = None
         started = monotonic()
+        last_activity = monotonic()
+        abort_reason: str | None = None
 
         async def read_stdout() -> None:
-            nonlocal result_event
+            nonlocal result_event, last_rate_limit, last_activity, abort_reason
             assert proc.stdout is not None
             async for raw in proc.stdout:
+                last_activity = monotonic()
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
@@ -131,25 +149,64 @@ class ClaudeRunner:
                     logger.warning("claude.run.bad_line line={l!r}", l=line[:200])
                     continue
                 events.append(event)
-                if event.get("type") == "result":
+                etype = event.get("type")
+                if etype == "result":
                     result_event = event
+                elif etype == "rate_limit_event":
+                    info = event.get("rate_limit_info", {})
+                    last_rate_limit = info
+                    if _rate_limit_blocking(info):
+                        resets_at = info.get("resetsAt")
+                        wait = (resets_at - time()) if resets_at else None
+                        if wait is None or wait > request.rate_limit_wait_threshold_seconds:
+                            abort_reason = "rate_limited"
+                            logger.warning(
+                                "claude.run.rate_limited status={s} resets_at={r}",
+                                s=info.get("status"),
+                                r=resets_at,
+                            )
+                            return
                 if on_event is not None:
                     try:
                         await on_event(event)
                     except Exception:
                         logger.exception("claude.run.on_event_failed")
 
+        async def watchdog() -> None:
+            nonlocal abort_reason
+            while True:
+                await asyncio.sleep(5)
+                if proc.returncode is not None:
+                    return
+                idle = monotonic() - last_activity
+                if idle > request.inactivity_timeout_seconds:
+                    abort_reason = "stalled"
+                    logger.warning(
+                        "claude.run.stalled idle={i}s cwd={c}",
+                        i=round(idle),
+                        c=str(request.cwd),
+                    )
+                    return
+
         timed_out = False
+        reader = asyncio.create_task(read_stdout())
+        guard = asyncio.create_task(watchdog())
+        waiter = asyncio.create_task(proc.wait())
         try:
-            await asyncio.wait_for(
-                asyncio.gather(read_stdout(), proc.wait()),
+            done, _pending = await asyncio.wait(
+                {reader, guard, waiter},
                 timeout=request.timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
             )
-        except TimeoutError:
-            timed_out = True
-            logger.warning("claude.run.timeout cwd={c}", c=str(request.cwd))
-            proc.kill()
-            await proc.wait()
+            if not done:
+                timed_out = True
+                logger.warning("claude.run.timeout cwd={c}", c=str(request.cwd))
+        finally:
+            for t in (reader, guard, waiter):
+                t.cancel()
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
 
         duration = monotonic() - started
         stderr_text = ""
@@ -159,6 +216,35 @@ class ClaudeRunner:
                 stderr_text = stderr_bytes.decode("utf-8", errors="replace")
             except TimeoutError:
                 pass
+
+        resets_at = last_rate_limit.get("resetsAt") if last_rate_limit else None
+
+        if abort_reason == "rate_limited":
+            return ClaudeRunResult(
+                success=False,
+                final_message=None,
+                error="rate limited — window exhausted",
+                duration_seconds=duration,
+                exit_code=None,
+                events=events,
+                stderr=stderr_text,
+                rate_limited=True,
+                rate_limit_resets_at=resets_at,
+            )
+
+        if abort_reason == "stalled":
+            blocking = last_rate_limit is not None and _rate_limit_blocking(last_rate_limit)
+            return ClaudeRunResult(
+                success=False,
+                final_message=None,
+                error=f"stalled — no output for {request.inactivity_timeout_seconds}s",
+                duration_seconds=duration,
+                exit_code=None,
+                events=events,
+                stderr=stderr_text,
+                rate_limited=blocking,
+                rate_limit_resets_at=resets_at if blocking else None,
+            )
 
         if timed_out:
             return ClaudeRunResult(

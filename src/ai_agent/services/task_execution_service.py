@@ -109,6 +109,11 @@ class TaskExecutionService:
                 "events": len(coding.events),
             },
         )
+        if coding.rate_limited:
+            raise AgentError(
+                "rate limited during coding",
+                details={"resets_at": coding.rate_limit_resets_at, "rate_limited": True},
+            )
         if not coding.success:
             raise AgentError(
                 "coder run failed",
