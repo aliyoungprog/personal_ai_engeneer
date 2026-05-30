@@ -1,4 +1,5 @@
 from html import escape
+from uuid import UUID
 
 from aiogram import Dispatcher, F
 from aiogram.filters import Command
@@ -97,3 +98,34 @@ def register_handlers(
                 (cb.message.text or "") + edit_suffix,
                 parse_mode="HTML",
             )
+
+    @dp.callback_query(F.data.startswith("mr:"))
+    async def on_mr_decision(cb: CallbackQuery) -> None:
+        if not _allowed(cb):
+            await cb.answer("not authorized", show_alert=True)
+            return
+        try:
+            _, action, run_id_str = (cb.data or "").split(":", 2)
+            run_id = UUID(run_id_str)
+        except (ValueError, IndexError):
+            await cb.answer("bad callback", show_alert=True)
+            return
+
+        if action == "approve":
+            await cb.answer("merging…")
+            if cb.message:
+                await cb.message.edit_text(
+                    (cb.message.text or "") + "\n\n⏳ <b>Мержу...</b>",
+                    parse_mode="HTML",
+                )
+            await decision_service.approve_mr(run_id)
+        elif action == "cancel":
+            await cb.answer("cancelling…")
+            if cb.message:
+                await cb.message.edit_text(
+                    (cb.message.text or "") + "\n\n🚫 <b>Отменено</b>",
+                    parse_mode="HTML",
+                )
+            await decision_service.cancel_run(run_id)
+        else:
+            await cb.answer("unknown action", show_alert=True)

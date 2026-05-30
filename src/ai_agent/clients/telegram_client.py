@@ -142,6 +142,36 @@ class TelegramClient:
         except Exception as e:
             raise TelegramError("send_mr_ready failed", details={"error": str(e)}) from e
 
+    async def send_run_finished(
+        self,
+        task: Task,
+        run: TaskRun,
+        mr_url: str | None,
+        succeeded: bool,
+    ) -> None:
+        tid = f"T-{task.notion_task_id}" if task.notion_task_id else "?"
+        if succeeded:
+            text = (
+                f"🎉 <b>{tid} смержена</b>\n"
+                f"📋 {escape(task.title)}\n"
+                f"🔗 <a href=\"{mr_url}\">MR</a>"
+            )
+        else:
+            link = f'\n🔗 <a href="{mr_url}">MR</a>' if mr_url else ""
+            text = (
+                f"🚫 <b>{tid} отменена</b>\n"
+                f"📋 {escape(task.title)}{link}"
+            )
+        try:
+            await self._bot.send_message(
+                chat_id=self._allowed_user_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            raise TelegramError("send_run_finished failed", details={"error": str(e)}) from e
+
     async def send_task_removed(self, task: Task) -> None:
         tid = f"T-{task.notion_task_id}" if task.notion_task_id else "?"
         text = (
