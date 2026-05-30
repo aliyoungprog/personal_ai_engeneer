@@ -5,6 +5,7 @@ from ai_agent.ai.claude_runner import (
     ClaudeRunRequest,
     ClaudeRunResult,
 )
+from ai_agent.ai.reviewer import ReviewerAgent, ReviewFinding, ReviewVerdict
 
 __all__ = (
     "DEFAULT_ALLOWED_TOOLS",
@@ -12,4 +13,7 @@ __all__ = (
     "ClaudeRunRequest",
     "ClaudeRunResult",
     "ClaudeRunner",
+    "ReviewFinding",
+    "ReviewVerdict",
+    "ReviewerAgent",
 )
