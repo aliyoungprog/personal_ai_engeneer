@@ -23,3 +23,7 @@ class NotionError(AgentError):
 
 class TelegramError(AgentError):
     """Raised on Telegram operation failure."""
+
+
+class GitError(AgentError):
+    """Raised on git subprocess failure."""

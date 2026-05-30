@@ -1,6 +1,7 @@
 from ai_agent.errors.exceptions import (
     AgentError,
     DatabaseError,
+    GitError,
     NotFoundError,
     NotionError,
     TelegramError,
@@ -9,6 +10,7 @@ from ai_agent.errors.exceptions import (
 __all__ = (
     "AgentError",
     "DatabaseError",
+    "GitError",
     "NotFoundError",
     "NotionError",
     "TelegramError",
