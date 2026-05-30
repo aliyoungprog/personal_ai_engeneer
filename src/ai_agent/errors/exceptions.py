@@ -27,3 +27,7 @@ class TelegramError(AgentError):
 
 class GitError(AgentError):
     """Raised on git subprocess failure."""
+
+
+class GitLabError(AgentError):
+    """Raised on GitLab API failure."""
