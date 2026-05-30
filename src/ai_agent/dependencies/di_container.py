@@ -82,6 +82,7 @@ class DIContainer(containers.DeclarativeContainer):
         worktree_manager=worktree_manager,
         gitlab_client=gitlab_client,
         telegram_client=telegram_client,
+        notion_client=notion_client,
     )
     task_decision_service = providers.Singleton(
         TaskDecisionService,

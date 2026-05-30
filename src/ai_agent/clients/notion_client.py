@@ -3,6 +3,7 @@ from typing import Any
 from loguru import logger
 from notion_client import AsyncClient
 
+from ai_agent.clients._notion_blocks import blocks_to_markdown
 from ai_agent.errors import NotionError
 from ai_agent.schemas import NotionTaskDTO
 
@@ -88,6 +89,46 @@ class NotionClient:
                 break
             cursor = resp.get("next_cursor")
         return results
+
+    async def fetch_page_body(self, page_id: str, max_depth: int = 2) -> str:
+        """Fetch a page's block tree and render it to Markdown.
+
+        Recurses into child blocks up to `max_depth` to capture nested lists
+        and toggles. Returns an empty string on failure (body is best-effort).
+        """
+
+        try:
+            blocks = await self._fetch_blocks(page_id, depth=0, max_depth=max_depth)
+        except Exception as e:
+            logger.warning("notion.fetch_body_failed page={p} err={e}", p=page_id, e=str(e))
+            return ""
+        return blocks_to_markdown(blocks)
+
+    async def _fetch_blocks(
+        self,
+        block_id: str,
+        depth: int,
+        max_depth: int,
+    ) -> list[dict[str, Any]]:
+        collected: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {"block_id": block_id, "page_size": 100}
+            if cursor:
+                params["start_cursor"] = cursor
+            resp = await self._client.blocks.children.list(**params)
+            for block in resp.get("results", []):
+                if block.get("has_children") and depth < max_depth:
+                    block["_children"] = await self._fetch_blocks(
+                        block["id"],
+                        depth=depth + 1,
+                        max_depth=max_depth,
+                    )
+                collected.append(block)
+            if not resp.get("has_more"):
+                break
+            cursor = resp.get("next_cursor")
+        return collected
 
 
 def _parse_page(page: dict[str, Any]) -> NotionTaskDTO:

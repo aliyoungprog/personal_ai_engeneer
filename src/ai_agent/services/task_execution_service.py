@@ -15,7 +15,7 @@ from uuid import UUID
 from loguru import logger
 
 from ai_agent.ai import ClaudeRunner, ClaudeRunRequest, ReviewerAgent
-from ai_agent.clients import GitLabClient, TelegramClient
+from ai_agent.clients import GitLabClient, NotionClient, TelegramClient
 from ai_agent.database.models import Task, TaskRun, TaskRunStatus
 from ai_agent.errors import AgentError, NotFoundError
 from ai_agent.gates import QualityGates
@@ -37,6 +37,7 @@ class TaskExecutionService:
         worktree_manager: WorktreeManager,
         gitlab_client: GitLabClient,
         telegram_client: TelegramClient,
+        notion_client: NotionClient,
     ) -> None:
         self._task_runs = task_runs_repository
         self._claude = claude_runner
@@ -46,6 +47,7 @@ class TaskExecutionService:
         self._worktree = worktree_manager
         self._gitlab = gitlab_client
         self._tg = telegram_client
+        self._notion = notion_client
         self._lock = asyncio.Lock()
 
     async def start(self, task: Task) -> None:
@@ -87,7 +89,8 @@ class TaskExecutionService:
         # 2) CODING — first claude pass
         await self._set_status(run, TaskRunStatus.CODING)
         await self._tg.send_execution_progress(task, run, "🤖 Claude пишет код…")
-        prompt = build_coder_prompt(task)
+        body = await self._notion.fetch_page_body(task.notion_page_id)
+        prompt = build_coder_prompt(task, body=body)
         coding = await self._claude.run(
             ClaudeRunRequest(cwd=handle.path, prompt=prompt, timeout_seconds=1800),
         )
