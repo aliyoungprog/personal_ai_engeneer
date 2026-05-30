@@ -43,11 +43,18 @@ class WorktreeManager:
         branch = f"ai-agent/{slug}"
         base_ref = f"origin/{self._repo.default_branch}"
 
+        # A previous run for the same slug may have crashed before cleanup.
+        # Remove any stale worktree + branch so a retry starts clean.
         if path.exists():
-            raise GitError(
-                "worktree path already exists",
-                details={"path": str(path)},
-            )
+            logger.warning("worktree.stale_found slug={s} — removing before recreate", s=slug)
+            await self.remove(slug)
+        # Prune git's worktree registry in case the dir was deleted out-of-band,
+        # then drop a leftover branch so 'worktree add -b' won't collide.
+        await run_git("worktree", "prune", cwd=self._repo.path)
+        try:
+            await run_git("branch", "-D", branch, cwd=self._repo.path)
+        except GitError:
+            pass
 
         self._root.mkdir(parents=True, exist_ok=True)
         logger.info("worktree.create slug={s} branch={b}", s=slug, b=branch)
