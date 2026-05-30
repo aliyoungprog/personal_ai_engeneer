@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     database_url: str = "postgres://agent:agent@postgres:5432/agent"
     log_level: str = "INFO"
 
+    # Model aliases for the coding/review agents. Sonnet is much lighter on the
+    # Max 5-hour rate limit than Opus, which matters for an always-on agent.
+    coder_model: str = "sonnet"
+    reviewer_model: str = "sonnet"
+
     @property
     def notion_project_whitelist(self) -> list[str]:
         return _csv(self.notion_project_whitelist_raw)

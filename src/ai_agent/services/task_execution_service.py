@@ -24,6 +24,7 @@ from ai_agent.git_ops.worktree import make_branch_slug
 from ai_agent.repositories import TaskRunsRepository
 from ai_agent.schemas import MRCreateRequest
 from ai_agent.services.coder_prompt import build_coder_prompt, build_mr_description
+from ai_agent.settings import settings
 
 
 class TaskExecutionService:
@@ -92,7 +93,12 @@ class TaskExecutionService:
         body = await self._notion.fetch_page_body(task.notion_page_id)
         prompt = build_coder_prompt(task, body=body)
         coding = await self._claude.run(
-            ClaudeRunRequest(cwd=handle.path, prompt=prompt, timeout_seconds=1800),
+            ClaudeRunRequest(
+                cwd=handle.path,
+                prompt=prompt,
+                model=settings.coder_model,
+                timeout_seconds=1800,
+            ),
         )
         await self._task_runs.append_event(
             run,

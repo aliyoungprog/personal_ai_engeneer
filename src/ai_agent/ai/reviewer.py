@@ -96,8 +96,9 @@ class ReviewerAgent:
         "Bash(sudo:*)",
     )
 
-    def __init__(self, runner: ClaudeRunner) -> None:
+    def __init__(self, runner: ClaudeRunner, model: str | None = None) -> None:
         self._runner = runner
+        self._model = model
 
     async def review(
         self,
@@ -112,6 +113,7 @@ class ReviewerAgent:
                 cwd=worktree_path,
                 prompt=prompt,
                 system_prompt=REVIEWER_SYSTEM_PROMPT,
+                model=self._model,
                 allowed_tools=self.READ_ONLY_TOOLS,
                 disallowed_tools=self.DENIED_TOOLS,
                 permission_mode="default",

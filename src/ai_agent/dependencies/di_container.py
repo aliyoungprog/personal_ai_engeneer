@@ -66,7 +66,11 @@ class DIContainer(containers.DeclarativeContainer):
 
     # AI components
     claude_runner = providers.Singleton(ClaudeRunner)
-    reviewer = providers.Singleton(ReviewerAgent, runner=claude_runner)
+    reviewer = providers.Singleton(
+        ReviewerAgent,
+        runner=claude_runner,
+        model=app_settings.provided.reviewer_model,
+    )
 
     # Quality gates
     quality_gates = providers.Singleton(QualityGates)

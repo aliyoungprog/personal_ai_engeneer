@@ -54,6 +54,7 @@ class ClaudeRunRequest(BaseModel):
     prompt: str
     system_prompt: str | None = None
     append_system_prompt: str | None = None
+    model: str | None = None  # alias ('sonnet'/'opus') or full id; None = CLI default
     allowed_tools: tuple[str, ...] = DEFAULT_ALLOWED_TOOLS
     disallowed_tools: tuple[str, ...] = DEFAULT_DISALLOWED_TOOLS
     permission_mode: PermissionMode = "acceptEdits"
@@ -208,6 +209,8 @@ class ClaudeRunner:
             "--permission-mode",
             request.permission_mode,
         ]
+        if request.model:
+            argv += ["--model", request.model]
         if request.allowed_tools:
             argv += ["--allowed-tools", ",".join(request.allowed_tools)]
         if request.disallowed_tools:
