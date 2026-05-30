@@ -45,6 +45,10 @@ class Settings(BaseSettings):
     # When true the executor stops after REVIEWING (no push / MR / merge).
     execution_dry_run: bool = False
 
+    # Debug: on startup, inject one synthetic accepted task and run it through
+    # the real execution service (PID-1 path, bypasses Telegram). For testing.
+    demo_task_on_start: bool = False
+
     @property
     def notion_project_whitelist(self) -> list[str]:
         return _csv(self.notion_project_whitelist_raw)

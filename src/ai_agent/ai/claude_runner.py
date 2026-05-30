@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from time import monotonic, time
+from time import monotonic
 from typing import Any, Literal
 
 from loguru import logger
@@ -92,6 +93,31 @@ def _rate_limit_blocking(info: dict[str, Any]) -> bool:
     return info.get("status") not in (None, "allowed")
 
 
+def _parse_events(
+    stdout_bytes: bytes,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, dict[str, Any] | None]:
+    """Parse stream-json stdout into (events, last result event, last rate-limit info)."""
+
+    events: list[dict[str, Any]] = []
+    result_event: dict[str, Any] | None = None
+    last_rate_limit: dict[str, Any] | None = None
+    for raw in stdout_bytes.decode("utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        events.append(event)
+        etype = event.get("type")
+        if etype == "result":
+            result_event = event
+        elif etype == "rate_limit_event":
+            last_rate_limit = event.get("rate_limit_info", {})
+    return events, result_event, last_rate_limit
+
+
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 
@@ -117,155 +143,87 @@ class ClaudeRunner:
             a=len(request.allowed_tools),
             d=len(request.disallowed_tools),
         )
+        # NOTE: claude (a Node process) is spawned via a SYNCHRONOUS subprocess
+        # inside a worker thread, NOT asyncio.create_subprocess_exec. On colima
+        # (vz, macOS) the asyncio subprocess transport reliably SIGKILLs the
+        # node child at ~20-30s; a plain subprocess survives. on_event real-time
+        # streaming is therefore not available (the orchestrator emits its own
+        # stage-level progress instead).
+        return await asyncio.to_thread(self._run_blocking, argv, request)
 
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=str(request.cwd),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        assert proc.stdin is not None
-        proc.stdin.write(request.prompt.encode("utf-8"))
-        await proc.stdin.drain()
-        proc.stdin.close()
-
-        events: list[dict[str, Any]] = []
-        result_event: dict[str, Any] | None = None
-        last_rate_limit: dict[str, Any] | None = None
+    def _run_blocking(self, argv: list[str], request: ClaudeRunRequest) -> ClaudeRunResult:
+        # subprocess.run (via communicate) reads stdout+stderr concurrently and
+        # survives on colima where incremental Popen reads / asyncio transport
+        # get the node child SIGKILL'd. Events are parsed after completion.
         started = monotonic()
-        last_activity = monotonic()
-        abort_reason: str | None = None
-
-        async def read_stdout() -> None:
-            nonlocal result_event, last_rate_limit, last_activity, abort_reason
-            assert proc.stdout is not None
-            async for raw in proc.stdout:
-                last_activity = monotonic()
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    logger.warning("claude.run.bad_line line={l!r}", l=line[:200])
-                    continue
-                events.append(event)
-                etype = event.get("type")
-                if etype == "result":
-                    result_event = event
-                elif etype == "rate_limit_event":
-                    info = event.get("rate_limit_info", {})
-                    last_rate_limit = info
-                    if _rate_limit_blocking(info):
-                        resets_at = info.get("resetsAt")
-                        wait = (resets_at - time()) if resets_at else None
-                        if wait is None or wait > request.rate_limit_wait_threshold_seconds:
-                            abort_reason = "rate_limited"
-                            logger.warning(
-                                "claude.run.rate_limited status={s} resets_at={r}",
-                                s=info.get("status"),
-                                r=resets_at,
-                            )
-                            return
-                if on_event is not None:
-                    try:
-                        await on_event(event)
-                    except Exception:
-                        logger.exception("claude.run.on_event_failed")
-
-        async def watchdog() -> None:
-            nonlocal abort_reason
-            while True:
-                await asyncio.sleep(5)
-                if proc.returncode is not None:
-                    return
-                idle = monotonic() - last_activity
-                if idle > request.inactivity_timeout_seconds:
-                    abort_reason = "stalled"
-                    logger.warning(
-                        "claude.run.stalled idle={i}s cwd={c}",
-                        i=round(idle),
-                        c=str(request.cwd),
-                    )
-                    return
-
         timed_out = False
-        reader = asyncio.create_task(read_stdout())
-        guard = asyncio.create_task(watchdog())
-        waiter = asyncio.create_task(proc.wait())
+        stdout_bytes = b""
+        stderr_bytes = b""
         try:
-            done, _pending = await asyncio.wait(
-                {reader, guard, waiter},
+            completed = subprocess.run(  # noqa: S603 — argv built internally
+                argv,
+                cwd=str(request.cwd),
+                input=request.prompt.encode("utf-8"),
+                capture_output=True,
                 timeout=request.timeout_seconds,
-                return_when=asyncio.FIRST_COMPLETED,
+                check=False,
             )
-            if not done:
-                timed_out = True
-                logger.warning("claude.run.timeout cwd={c}", c=str(request.cwd))
-        finally:
-            for t in (reader, guard, waiter):
-                t.cancel()
-            if proc.returncode is None:
-                proc.kill()
-                await proc.wait()
+            stdout_bytes = completed.stdout
+            stderr_bytes = completed.stderr
+            exit_code: int | None = completed.returncode
+        except subprocess.TimeoutExpired as e:
+            timed_out = True
+            exit_code = None
+            stdout_bytes = e.stdout or b""
+            stderr_bytes = e.stderr or b""
+            logger.warning("claude.run.timeout cwd={c}", c=str(request.cwd))
 
         duration = monotonic() - started
-        stderr_text = ""
-        if proc.stderr is not None:
-            try:
-                stderr_bytes = await asyncio.wait_for(proc.stderr.read(), timeout=2)
-                stderr_text = stderr_bytes.decode("utf-8", errors="replace")
-            except TimeoutError:
-                pass
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
 
+        events, result_event, last_rate_limit = _parse_events(stdout_bytes)
         resets_at = last_rate_limit.get("resetsAt") if last_rate_limit else None
+        blocking_rl = last_rate_limit is not None and _rate_limit_blocking(last_rate_limit)
 
-        if abort_reason == "rate_limited":
+        if timed_out:
+            return ClaudeRunResult(
+                success=False,
+                final_message=None,
+                error=(
+                    "rate limited — window exhausted"
+                    if blocking_rl
+                    else f"timeout after {request.timeout_seconds}s"
+                ),
+                duration_seconds=duration,
+                exit_code=None,
+                events=events,
+                stderr=stderr_text,
+                rate_limited=blocking_rl,
+                rate_limit_resets_at=resets_at if blocking_rl else None,
+            )
+
+        # A completed run that nonetheless hit a blocking rate-limit event.
+        if blocking_rl and (result_event is None or result_event.get("subtype") != "success"):
+            logger.warning("claude.run.rate_limited resets_at={r}", r=resets_at)
             return ClaudeRunResult(
                 success=False,
                 final_message=None,
                 error="rate limited — window exhausted",
                 duration_seconds=duration,
-                exit_code=None,
+                exit_code=exit_code,
                 events=events,
                 stderr=stderr_text,
                 rate_limited=True,
                 rate_limit_resets_at=resets_at,
             )
 
-        if abort_reason == "stalled":
-            blocking = last_rate_limit is not None and _rate_limit_blocking(last_rate_limit)
+        if exit_code not in (0, None):
             return ClaudeRunResult(
                 success=False,
                 final_message=None,
-                error=f"stalled — no output for {request.inactivity_timeout_seconds}s",
+                error=f"exit code {exit_code}",
                 duration_seconds=duration,
-                exit_code=None,
-                events=events,
-                stderr=stderr_text,
-                rate_limited=blocking,
-                rate_limit_resets_at=resets_at if blocking else None,
-            )
-
-        if timed_out:
-            return ClaudeRunResult(
-                success=False,
-                final_message=None,
-                error=f"timeout after {request.timeout_seconds}s",
-                duration_seconds=duration,
-                exit_code=None,
-                events=events,
-                stderr=stderr_text,
-            )
-
-        if proc.returncode != 0:
-            return ClaudeRunResult(
-                success=False,
-                final_message=None,
-                error=f"exit code {proc.returncode}",
-                duration_seconds=duration,
-                exit_code=proc.returncode,
+                exit_code=exit_code,
                 events=events,
                 stderr=stderr_text,
             )
@@ -277,7 +235,7 @@ class ClaudeRunner:
             final_message=final_message,
             error=None if is_success else "no success result event",
             duration_seconds=duration,
-            exit_code=proc.returncode,
+            exit_code=exit_code,
             events=events,
             stderr=stderr_text,
         )

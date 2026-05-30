@@ -23,6 +23,9 @@ async def run() -> None:
     telegram = get_telegram_interface()
     poller = get_notion_poller()
 
+    if settings.demo_task_on_start:
+        await _inject_demo_task()
+
     stop_event = asyncio.Event()
 
     def _request_stop(*_: object) -> None:
@@ -52,6 +55,29 @@ async def run() -> None:
     await get_notion_client().close()
     await database_disconnect()
     logger.info("shutdown.complete")
+
+
+async def _inject_demo_task() -> None:
+    """Debug hook: create one synthetic accepted task and run it via the real
+    execution service from the PID-1 process (bypasses Telegram + docker exec)."""
+
+    from ai_agent.database.models import Task
+    from ai_agent.dependencies import get_container
+
+    page_id = "demo-pid1-trigger-0001"
+    task = await Task.get_or_none(notion_page_id=page_id)
+    if task is None:
+        task = await Task.create(
+            notion_page_id=page_id,
+            notion_task_id=4242,
+            title="Add scratch/agent_demo/temperature.py with c<->f conversion + tests",
+            project="AI Platform",
+            status="To Do",
+            url="https://example.invalid/demo",
+            decision="accepted",
+        )
+    logger.info("demo.inject page={p}", p=task.notion_page_id)
+    await get_container().task_execution_service().start(task)
 
 
 def main() -> None:
