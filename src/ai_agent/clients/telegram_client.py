@@ -3,9 +3,9 @@ from html import escape
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from ai_agent.database.models import Task
+from ai_agent.database.models import Task, TaskRun
 from ai_agent.errors import TelegramError
-from ai_agent.schemas import NotionTaskDTO, TaskChangesDTO
+from ai_agent.schemas import MRInfo, NotionTaskDTO, TaskChangesDTO
 
 
 class TelegramClient:
@@ -80,6 +80,67 @@ class TelegramClient:
             )
         except Exception as e:
             raise TelegramError("send_task_changed failed", details={"error": str(e)}) from e
+
+    async def send_execution_progress(self, task: Task, run: TaskRun, line: str) -> None:
+        tid = f"T-{task.notion_task_id}" if task.notion_task_id else "?"
+        text = f"⚙️ <b>{tid}</b> {escape(line)}"
+        try:
+            await self._bot.send_message(
+                chat_id=self._allowed_user_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            raise TelegramError("send_execution_progress failed", details={"error": str(e)}) from e
+
+    async def send_execution_failed(self, task: Task, run: TaskRun, reason: str) -> None:
+        tid = f"T-{task.notion_task_id}" if task.notion_task_id else "?"
+        text = (
+            f"❌ <b>{tid} провалилась</b>\n"
+            f"📋 {escape(task.title)}\n"
+            f"Этап: <code>{escape(run.status)}</code>\n"
+            f"<pre>{escape(reason[:600])}</pre>"
+        )
+        try:
+            await self._bot.send_message(
+                chat_id=self._allowed_user_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            raise TelegramError("send_execution_failed failed", details={"error": str(e)}) from e
+
+    async def send_mr_ready(self, task: Task, run: TaskRun, mr: MRInfo) -> None:
+        tid = f"T-{task.notion_task_id}" if task.notion_task_id else "?"
+        text = (
+            f"✅ <b>{tid} готова к ревью</b>\n"
+            f"📋 {escape(task.title)}\n"
+            f"🔗 <a href=\"{mr.web_url}\">MR !{mr.iid}</a>\n"
+            f"Жми <b>Approve</b> чтобы смержить."
+        )
+        rid = str(run.id)
+        approve_cb = f"mr:approve:{rid}"
+        cancel_cb = f"mr:cancel:{rid}"
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Approve & merge", callback_data=approve_cb),
+                    InlineKeyboardButton(text="❌ Cancel", callback_data=cancel_cb),
+                ]
+            ]
+        )
+        try:
+            await self._bot.send_message(
+                chat_id=self._allowed_user_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            raise TelegramError("send_mr_ready failed", details={"error": str(e)}) from e
 
     async def send_task_removed(self, task: Task) -> None:
         tid = f"T-{task.notion_task_id}" if task.notion_task_id else "?"
