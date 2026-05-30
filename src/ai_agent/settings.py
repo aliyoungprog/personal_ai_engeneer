@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     coder_model: str = "sonnet"
     reviewer_model: str = "sonnet"
 
+    # When true the executor stops after REVIEWING (no push / MR / merge).
+    execution_dry_run: bool = False
+
     @property
     def notion_project_whitelist(self) -> list[str]:
         return _csv(self.notion_project_whitelist_raw)

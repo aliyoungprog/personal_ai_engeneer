@@ -87,6 +87,7 @@ class DIContainer(containers.DeclarativeContainer):
         gitlab_client=gitlab_client,
         telegram_client=telegram_client,
         notion_client=notion_client,
+        dry_run=app_settings.provided.execution_dry_run,
     )
     task_decision_service = providers.Singleton(
         TaskDecisionService,

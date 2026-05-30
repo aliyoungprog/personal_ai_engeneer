@@ -30,6 +30,8 @@ DEFAULT_ALLOWED_TOOLS: tuple[str, ...] = (
     "Bash(mypy:*)",
     "Bash(pytest:*)",
     "Bash(uv:*)",
+    "Bash(python:*)",
+    "Bash(python3:*)",
     "Bash(git diff:*)",
     "Bash(git log:*)",
     "Bash(git status:*)",

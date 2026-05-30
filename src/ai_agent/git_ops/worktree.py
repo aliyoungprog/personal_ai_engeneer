@@ -74,15 +74,23 @@ class WorktreeManager:
         branch = f"ai-agent/{slug}"
         logger.info("worktree.remove slug={s}", s=slug)
         try:
+            # Two --force flags also drop a worktree left 'locked' (e.g. a run
+            # killed mid 'worktree add', lock reason 'initializing').
             await run_git(
                 "worktree",
                 "remove",
+                "--force",
                 "--force",
                 str(path),
                 cwd=self._repo.path,
             )
         except GitError as e:
             logger.warning("worktree.remove_failed slug={s} detail={d}", s=slug, d=e.details)
+        # Always prune the registry in case the dir was already gone.
+        try:
+            await run_git("worktree", "prune", cwd=self._repo.path)
+        except GitError:
+            pass
         if delete_branch:
             try:
                 await run_git("branch", "-D", branch, cwd=self._repo.path)

@@ -39,6 +39,7 @@ class TaskExecutionService:
         gitlab_client: GitLabClient,
         telegram_client: TelegramClient,
         notion_client: NotionClient,
+        dry_run: bool = False,
     ) -> None:
         self._task_runs = task_runs_repository
         self._claude = claude_runner
@@ -49,7 +50,16 @@ class TaskExecutionService:
         self._gitlab = gitlab_client
         self._tg = telegram_client
         self._notion = notion_client
+        self._dry_run = dry_run
         self._lock = asyncio.Lock()
+
+    async def _notify(self, task: Task, run: TaskRun, line: str) -> None:
+        """Best-effort progress ping; a Telegram outage must not abort a run."""
+
+        try:
+            await self._tg.send_execution_progress(task, run, line)
+        except Exception:
+            logger.warning("execution.notify_failed page={p}", p=task.notion_page_id)
 
     async def start(self, task: Task) -> None:
         """Kick off execution as a background task (fire-and-forget)."""
@@ -72,16 +82,22 @@ class TaskExecutionService:
                     d=e.details,
                 )
                 await self._task_runs.mark_failed(run, str(e))
-                await self._tg.send_execution_failed(task, run, f"{e}: {e.details}")
+                await self._notify_failed(task, run, f"{e}: {e.details}")
             except Exception as e:
                 logger.exception("execution.crashed page={p}", p=task.notion_page_id)
                 await self._task_runs.mark_failed(run, repr(e))
-                await self._tg.send_execution_failed(task, run, repr(e))
+                await self._notify_failed(task, run, repr(e))
+
+    async def _notify_failed(self, task: Task, run: TaskRun, reason: str) -> None:
+        try:
+            await self._tg.send_execution_failed(task, run, reason)
+        except Exception:
+            logger.warning("execution.notify_failed_failed page={p}", p=task.notion_page_id)
 
     async def _execute(self, run: TaskRun, task: Task) -> None:
         # 1) PREPARING — clone+worktree
         await self._set_status(run, TaskRunStatus.PREPARING)
-        await self._tg.send_execution_progress(task, run, "🔧 готовлю worktree…")
+        await self._notify(task, run, "готовлю worktree")
         await self._repo.ensure_cloned()
         slug = make_branch_slug(task.notion_task_id, task.title)
         handle = await self._worktree.create(slug)
@@ -89,7 +105,7 @@ class TaskExecutionService:
 
         # 2) CODING — first claude pass
         await self._set_status(run, TaskRunStatus.CODING)
-        await self._tg.send_execution_progress(task, run, "🤖 Claude пишет код…")
+        await self._notify(task, run, "Claude пишет код")
         body = await self._notion.fetch_page_body(task.notion_page_id)
         prompt = build_coder_prompt(task, body=body)
         coding = await self._claude.run(
@@ -124,7 +140,7 @@ class TaskExecutionService:
 
         # 3) TESTING — gates
         await self._set_status(run, TaskRunStatus.TESTING)
-        await self._tg.send_execution_progress(task, run, "🧪 запускаю линтер и тесты…")
+        await self._notify(task, run, "запускаю линтер и тесты")
         gate_suite = await self._gates.run(handle.path)
         await self._task_runs.append_event(
             run,
@@ -142,7 +158,7 @@ class TaskExecutionService:
 
         # 4) REVIEWING — reviewer agent
         await self._set_status(run, TaskRunStatus.REVIEWING)
-        await self._tg.send_execution_progress(task, run, "🔎 reviewer проверяет diff…")
+        await self._notify(task, run, "reviewer проверяет diff")
         diff = await self._worktree.diff_against_base(handle)
         verdict = await self._reviewer.review(
             worktree_path=handle.path,
@@ -164,9 +180,21 @@ class TaskExecutionService:
                 details={"summary": verdict.summary},
             )
 
+        if self._dry_run:
+            logger.info(
+                "execution.dry_run_done page={p} verdict={v} gates_passed={g}",
+                p=task.notion_page_id,
+                v=verdict.verdict,
+                g=gate_suite.all_passed,
+            )
+            await self._notify(task, run, "dry-run: дошли до review, push пропущен")
+            await self._task_runs.mark_done(run)
+            await self._worktree.remove(handle.slug)
+            return
+
         # 5) PUSHING — push branch + open MR
         await self._set_status(run, TaskRunStatus.PUSHING)
-        await self._tg.send_execution_progress(task, run, "🚀 пушу ветку и открываю MR…")
+        await self._notify(task, run, "пушу ветку и открываю MR")
         await self._worktree.push(handle)
         mr = await self._gitlab.create_merge_request(
             MRCreateRequest(
