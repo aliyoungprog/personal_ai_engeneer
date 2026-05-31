@@ -11,6 +11,35 @@ from ai_agent.git_ops._subprocess import run_git
 from ai_agent.git_ops.repo import RepoManager
 
 _SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+def parse_changed_lines(diff_text: str) -> dict[str, set[int]]:
+    """Parse `git diff --unified=0` into {repo-relative path: {new line numbers}}.
+
+    Only lines added/modified on the NEW side are recorded (pure deletions add
+    no new lines). A file with only deletions does not appear in the map.
+    """
+
+    result: dict[str, set[int]] = {}
+    current: str | None = None
+    for line in diff_text.splitlines():
+        if line.startswith("+++ "):
+            target = line[4:].strip()
+            if target == "/dev/null":
+                current = None
+            else:
+                current = target[2:] if target.startswith("b/") else target
+            continue
+        if current is None:
+            continue
+        m = _HUNK_RE.match(line)
+        if m:
+            start = int(m.group(1))
+            count = 1 if m.group(2) is None else int(m.group(2))
+            if count > 0:
+                result.setdefault(current, set()).update(range(start, start + count))
+    return result
 
 
 def make_branch_slug(task_id: int | None, title: str, max_len: int = 60) -> str:
@@ -138,6 +167,21 @@ class WorktreeManager:
             cwd=handle.path,
         )
         return [line.strip() for line in out.splitlines() if line.strip()]
+
+    async def changed_line_map(self, handle: WorktreeHandle) -> dict[str, set[int]]:
+        """Per changed file, the set of NEW-file line numbers this branch adds.
+
+        Used to scope quality gates to the lines the change is responsible for,
+        so a legacy file's pre-existing lint/type errors don't fail the run.
+        """
+
+        out = await run_git(
+            "diff",
+            "--unified=0",
+            f"origin/{self._repo.default_branch}...HEAD",
+            cwd=handle.path,
+        )
+        return parse_changed_lines(out)
 
     async def revert_file_to_base(
         self, handle: WorktreeHandle, rel_path: str, *, message: str

@@ -2,7 +2,7 @@ from pathlib import Path
 
 from dependency_injector import containers, providers
 
-from ai_agent.ai import ClaudeRunner, ReviewerAgent
+from ai_agent.ai import ClaudeRunner, ReviewerAgent, TesterAgent
 from ai_agent.clients import GitLabClient, NotionClient, TelegramClient
 from ai_agent.gates import QualityGates
 from ai_agent.git_ops import RepoManager, WorktreeManager
@@ -73,6 +73,11 @@ class DIContainer(containers.DeclarativeContainer):
         runner=claude_runner,
         model=app_settings.provided.reviewer_model,
     )
+    tester = providers.Singleton(
+        TesterAgent,
+        runner=claude_runner,
+        model=app_settings.provided.tester_model,
+    )
 
     # Quality gates
     quality_gates = providers.Singleton(QualityGates)
@@ -84,6 +89,7 @@ class DIContainer(containers.DeclarativeContainer):
         tasks_repository=tasks_repository,
         claude_runner=claude_runner,
         reviewer=reviewer,
+        tester=tester,
         quality_gates=quality_gates,
         repo_manager=repo_manager,
         worktree_manager=worktree_manager,

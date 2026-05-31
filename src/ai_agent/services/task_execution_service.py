@@ -1,13 +1,14 @@
 """Orchestrates a single Task → MR run.
 
-  PREPARING → [ CODING → TESTING → REVIEWING ]* → PUSHING → AWAITING_APPROVAL
+  PREPARING → [ CODING → TESTING → REVIEWING → TESTER ]* → PUSHING → AWAITING_APPROVAL
 
-The CODING → TESTING → REVIEWING block iterates: when the quality gates fail or
-the reviewer requests changes, their feedback is fed back to the coder for a
-fresh fix pass (in the same worktree, building on the prior commits), up to
-`settings.max_iterations` passes. The run fails only if it is still unhappy
-after the last pass. The AWAITING_APPROVAL → MERGING transition is triggered by
-a Telegram /approve.
+The CODING → TESTING → REVIEWING → TESTER block iterates: when the quality gates
+fail, the reviewer requests changes, or the QA tester's tests fail, that
+feedback is fed back to the coder for a fresh fix pass (in the same worktree,
+building on the prior commits), up to `settings.max_iterations` passes. The run
+fails only if it is still unhappy after the last pass. The TESTER stage (a QA
+agent that writes + runs tests) can be disabled via `settings.run_tester`. The
+AWAITING_APPROVAL → MERGING transition is triggered by a Telegram /approve.
 """
 
 from __future__ import annotations
@@ -21,7 +22,13 @@ from uuid import UUID
 
 from loguru import logger
 
-from ai_agent.ai import ClaudeRunner, ClaudeRunRequest, ReviewerAgent, ReviewVerdict
+from ai_agent.ai import (
+    ClaudeRunner,
+    ClaudeRunRequest,
+    ReviewerAgent,
+    ReviewVerdict,
+    TesterAgent,
+)
 from ai_agent.clients import GitLabClient, NotionClient, TelegramClient
 from ai_agent.database.models import Task, TaskRun, TaskRunStatus
 from ai_agent.errors import AgentError, NotFoundError
@@ -150,6 +157,7 @@ class TaskExecutionService:
         tasks_repository: TasksRepository,
         claude_runner: ClaudeRunner,
         reviewer: ReviewerAgent,
+        tester: TesterAgent,
         quality_gates: QualityGates,
         repo_manager: RepoManager,
         worktree_manager: WorktreeManager,
@@ -162,6 +170,7 @@ class TaskExecutionService:
         self._tasks = tasks_repository
         self._claude = claude_runner
         self._reviewer = reviewer
+        self._tester = tester
         self._gates = quality_gates
         self._repo = repo_manager
         self._worktree = worktree_manager
@@ -312,11 +321,13 @@ class TaskExecutionService:
             # the lockfile to base so it never pollutes the MR.
             await self._drop_lockfile_noise(handle, run)
 
-            # TESTING — gates, scoped to the files this run actually changed
+            # TESTING — gates, scoped to the lines this run actually changed so
+            # a legacy file's pre-existing errors never fail the run.
             await self._set_status(run, TaskRunStatus.TESTING)
             changed = await self._worktree.changed_files(handle)
+            changed_lines = await self._worktree.changed_line_map(handle)
             await self._notify(task, run, "линтер и тесты по изменённым файлам")
-            gate_suite = await self._gates.run(handle.path, changed)
+            gate_suite = await self._gates.run(handle.path, changed, changed_lines)
             await self._task_runs.append_event(
                 run,
                 {
@@ -397,7 +408,56 @@ class TaskExecutionService:
                     details={"summary": verdict.summary},
                 )
 
-            # Gates passed and reviewer approved — done iterating.
+            # 4b) TESTER — QA agent writes + runs tests against the approved diff.
+            # A failure is fed back to the coder like gate/review feedback.
+            if settings.run_tester:
+                await self._set_status(run, TaskRunStatus.TESTER)
+                test_stream: _CodingStream | None = None
+                tester_prefix = "🧪" if attempt == 1 else f"🧪 #{attempt}"
+                if settings.stream_coding_to_telegram:
+                    test_stream = _CodingStream(
+                        self._tg, task, settings.stream_min_interval_seconds, prefix=tester_prefix
+                    )
+                    await test_stream.start()
+                else:
+                    await self._notify(task, run, "QA пишет и гоняет тесты")
+                test_verdict = await self._tester.test(
+                    worktree_path=handle.path,
+                    diff_text=diff,
+                    task_brief=task.title,
+                    on_event=test_stream,
+                )
+                if test_stream is not None:
+                    await test_stream.finalize(f"🧪 вердикт: {test_verdict.verdict}")
+                await self._task_runs.append_event(
+                    run,
+                    {
+                        "stage": "tester",
+                        "attempt": attempt,
+                        "verdict": test_verdict.verdict,
+                        "ran": test_verdict.ran,
+                        "tests_added": test_verdict.tests_added,
+                        "failures": len(test_verdict.failures),
+                    },
+                )
+                if not test_verdict.is_passed:
+                    if attempt < max_iters:
+                        feedback = test_verdict.feedback_for_claude()
+                        logger.info(
+                            "execution.iterate reason=tester attempt={a} next={n}",
+                            a=attempt,
+                            n=attempt + 1,
+                        )
+                        await self._notify(
+                            task, run, f"QA-тесты упали — итерация {attempt + 1}/{max_iters}"
+                        )
+                        continue
+                    raise AgentError(
+                        f"QA tests failed after {max_iters} iteration(s)",
+                        details={"summary": test_verdict.summary},
+                    )
+
+            # Gates passed, reviewer approved, QA tests green — done iterating.
             break
 
         assert gate_suite is not None and verdict is not None  # loop runs ≥1 pass
@@ -418,19 +478,25 @@ class TaskExecutionService:
         await self._set_status(run, TaskRunStatus.PUSHING)
         await self._notify(task, run, "пушу ветку и открываю MR")
         await self._worktree.push(handle)
+        # The tester may have committed test files after `changed` was last
+        # computed — refresh so the MR description lists them too.
+        changed = await self._worktree.changed_files(handle)
+        description = build_mr_description(task, verdict, gate_suite, task.url, changed)
         mr = await self._gitlab.create_merge_request(
             MRCreateRequest(
                 source_branch=handle.branch,
                 target_branch=self._repo.default_branch,
                 title=f"[ai-agent] {task.title}",
-                description=build_mr_description(task, verdict, gate_suite, task.url, changed),
+                description=description,
             )
         )
         await self._task_runs.set_mr(run, mr.iid, mr.web_url)
 
-        # 6) AWAITING_APPROVAL — Phase 1.10 handles the merge callback
+        # 6) AWAITING_APPROVAL — Phase 1.10 handles the merge callback. Send the
+        # full MR description into the chat so it can be reviewed without opening
+        # GitLab.
         await self._set_status(run, TaskRunStatus.AWAITING_APPROVAL)
-        await self._tg.send_mr_ready(task, run, mr)
+        await self._tg.send_mr_ready(task, run, mr, description=description)
 
     async def _set_status(self, run: TaskRun, status: TaskRunStatus) -> None:
         await self._task_runs.set_status(run, status)

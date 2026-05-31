@@ -12,12 +12,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from ai_agent.ai import ReviewFinding, ReviewVerdict
+from ai_agent.ai import ReviewFinding, ReviewVerdict, TesterVerdict
 from ai_agent.ai.claude_runner import ClaudeRunResult
 from ai_agent.errors import AgentError
 from ai_agent.gates import GateResult, GateSuite
@@ -76,6 +76,22 @@ def _request_changes() -> ReviewVerdict:
     )
 
 
+def _tester_pass() -> TesterVerdict:
+    return TesterVerdict(verdict="pass", summary="tests green", ran=True, tests_added=["t.py"])
+
+
+def _tester_fail() -> TesterVerdict:
+    from ai_agent.ai import TestFailure
+
+    return TesterVerdict(
+        verdict="fail",
+        summary="regression",
+        ran=True,
+        tests_added=["tests/test_new.py"],
+        failures=[TestFailure(test="tests/test_new.py::test_x", detail="AssertionError: 1 != 2")],
+    )
+
+
 @pytest.fixture
 def task() -> Any:
     return SimpleNamespace(
@@ -104,6 +120,7 @@ def _build_service(
     coder_results: list[ClaudeRunResult],
     gate_results: list[GateSuite],
     verdicts: list[ReviewVerdict],
+    tester_verdicts: list[TesterVerdict] | None = None,
     dry_run: bool = True,
 ) -> tuple[TaskExecutionService, MagicMock, AsyncMock]:
     claude = MagicMock()
@@ -111,6 +128,12 @@ def _build_service(
 
     reviewer = MagicMock()
     reviewer.review = AsyncMock(side_effect=verdicts)
+
+    tester = MagicMock()
+    if tester_verdicts is not None:
+        tester.test = AsyncMock(side_effect=tester_verdicts)
+    else:
+        tester.test = AsyncMock(return_value=_tester_pass())
 
     gates = MagicMock()
     gates.run = AsyncMock(side_effect=gate_results)
@@ -122,6 +145,7 @@ def _build_service(
     # changed_files is used both by _drop_lockfile_noise and the gates scope —
     # no "uv.lock" entry, so the lockfile-revert path is skipped.
     worktree.changed_files = AsyncMock(return_value=["app/foo.py"])
+    worktree.changed_line_map = AsyncMock(return_value={"app/foo.py": {1}})
     worktree.diff_against_base = AsyncMock(return_value="diff --git a/app/foo.py")
     worktree.revert_file_to_base = AsyncMock(return_value=False)
     worktree.push = AsyncMock()
@@ -150,6 +174,7 @@ def _build_service(
         tasks_repository=MagicMock(),
         claude_runner=claude,
         reviewer=reviewer,
+        tester=tester,
         quality_gates=gates,
         repo_manager=repo,
         worktree_manager=worktree,
@@ -263,3 +288,41 @@ async def test_fails_after_max_iterations_when_reviewer_never_approves(
 
     assert claude.run.call_count == 2
     assert review.call_count == 2
+
+
+async def test_tester_failure_drives_a_second_coder_pass(task: Any, run: Any) -> None:
+    # Reviewer approves both passes; the QA tester fails the first (its tests
+    # catch a bug) and passes the second after the coder fixes the impl.
+    service, claude, review = _build_service(
+        coder_results=[_coding(), _coding()],
+        gate_results=[_gates(passed=True), _gates(passed=True)],
+        verdicts=[_approve(), _approve()],
+        tester_verdicts=[_tester_fail(), _tester_pass()],
+    )
+
+    await service._execute(run, task)
+
+    assert claude.run.call_count == 2
+    assert review.call_count == 2
+    assert cast(AsyncMock, service._tester.test).call_count == 2
+    prompts = _coder_prompts(claude)
+    # The failing test detail is threaded back to the coder to fix the impl.
+    assert "AssertionError: 1 != 2" in prompts[1]
+
+
+async def test_tester_failure_after_max_iterations_fails_run(
+    task: Any, run: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "max_iterations", 2)
+    service, claude, review = _build_service(
+        coder_results=[_coding(), _coding()],
+        gate_results=[_gates(passed=True), _gates(passed=True)],
+        verdicts=[_approve(), _approve()],
+        tester_verdicts=[_tester_fail(), _tester_fail()],
+    )
+
+    with pytest.raises(AgentError, match="QA tests failed after 2 iteration"):
+        await service._execute(run, task)
+
+    assert claude.run.call_count == 2
+    assert cast(AsyncMock, service._tester.test).call_count == 2

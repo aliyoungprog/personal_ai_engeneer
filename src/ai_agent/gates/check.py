@@ -3,26 +3,31 @@
 Returns a structured GateSuite with pass/fail per gate + truncated output.
 The output tails are designed to be fed back to Claude as iteration feedback
 if any gate fails.
+
+Two scoping rules keep the gates fair on real (often legacy) target repos:
+  A. If a tool isn't available (`uv run --frozen <tool>` cannot spawn it), the
+     gate is SKIPPED, not failed — the coder cannot fix a missing tool.
+  B. Lint/typecheck only BLOCK on diagnostics on the lines this change added or
+     modified; a file's pre-existing errors never fail the run.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 from pathlib import Path
 from time import monotonic
+from typing import Any
 
 from loguru import logger
 from pydantic import BaseModel, ConfigDict
 
-
-class GateSpec(BaseModel):
-    """How to run one quality gate."""
-
-    name: str
-    command: tuple[str, ...]
-    timeout_seconds: int = 300
-    tail_lines: int = 80
+# uv prints this to stderr when the requested tool isn't installed in the env.
+_SPAWN_FAILURE_MARKER = "Failed to spawn"
+# A mypy diagnostic line: "path/to/file.py:123: error: message"
+_MYPY_LINE_RE = re.compile(r"^(?P<file>.+?):(?P<line>\d+):(?:\d+:)?\s*error:\s*(?P<msg>.*)$")
 
 
 class GateResult(BaseModel):
@@ -33,6 +38,8 @@ class GateResult(BaseModel):
     stdout_tail: str
     stderr_tail: str
     timed_out: bool = False
+    skipped: bool = False
+    skip_reason: str | None = None
 
 
 class GateSuite(BaseModel):
@@ -47,7 +54,7 @@ class GateSuite(BaseModel):
 
     @property
     def failures(self) -> list[GateResult]:
-        return [r for r in self.results if not r.passed]
+        return [r for r in self.results if not r.passed and not r.skipped]
 
     def feedback_for_claude(self) -> str:
         """Format failed gates as a prompt fragment to send back to Claude."""
@@ -70,7 +77,11 @@ class GateSuite(BaseModel):
                 lines.append(r.stderr_tail.strip())
                 lines.append("```")
             lines.append("")
-        lines.append("Please fix these issues. Do not change unrelated code.")
+        lines.append(
+            "These are errors on the lines your change touched. Fix them in your "
+            "changed source — do NOT add dependencies, tooling, or config to make "
+            "a check pass, and do not touch unrelated code."
+        )
         return "\n".join(lines)
 
 
@@ -104,90 +115,212 @@ def _select_test_targets(cwd: Path, py_files: list[str]) -> list[str]:
     return sorted(targets)
 
 
-def _build_specs(cwd: Path, py_files: list[str], test_timeout: int) -> list[GateSpec]:
-    """Lint/typecheck the changed files only; test their matching tests only.
+def _norm_path(filename: str, cwd: Path) -> str:
+    """Normalise a tool-reported path to a repo-relative POSIX string."""
 
-    `uv run --frozen` syncs the env from the existing lockfile WITHOUT rewriting
-    it — so gates never introduce uv.lock churn.
+    p = Path(filename)
+    if p.is_absolute():
+        try:
+            return os.path.relpath(p, cwd).replace(os.sep, "/")
+        except ValueError:
+            return p.as_posix()
+    return p.as_posix().removeprefix("./")
+
+
+def _in_scope(rel_path: str, row: int, changed_lines: dict[str, set[int]]) -> bool:
+    """True if a diagnostic at rel_path:row is on a line this change touched.
+
+    With no change-line info at all we cannot scope, so nothing is filtered
+    (fail-safe to whole-file behaviour). With info present, a file absent from
+    the map had only deletions → none of its diagnostics are in scope.
     """
 
-    specs = [
-        GateSpec(name="lint", command=("uv", "run", "--frozen", "ruff", "check", *py_files)),
-        GateSpec(name="typecheck", command=("uv", "run", "--frozen", "mypy", *py_files)),
-    ]
-    test_targets = _select_test_targets(cwd, py_files)
-    if test_targets:
-        specs.append(
-            GateSpec(
-                name="test",
-                command=("uv", "run", "--frozen", "pytest", "-q", *test_targets),
-                timeout_seconds=test_timeout,
-            )
-        )
-    else:
-        logger.info("gates.test_skip reason=no_matching_tests files={n}", n=len(py_files))
-    return specs
+    if not changed_lines:
+        return True
+    return row in changed_lines.get(rel_path, set())
+
+
+def _filter_ruff(
+    stdout: str, changed_lines: dict[str, set[int]], cwd: Path
+) -> list[dict[str, Any]]:
+    """Parse ruff --output-format=json and keep only in-scope diagnostics."""
+
+    data = json.loads(stdout) if stdout.strip() else []
+    kept: list[dict[str, Any]] = []
+    for d in data:
+        loc = d.get("location") or {}
+        row = loc.get("row")
+        rel = _norm_path(str(d.get("filename", "")), cwd)
+        if isinstance(row, int) and _in_scope(rel, row, changed_lines):
+            kept.append(d)
+    return kept
+
+
+def _format_ruff(diags: list[dict[str, Any]]) -> str:
+    out = []
+    for d in diags:
+        loc = d.get("location") or {}
+        where = f"{d.get('filename')}:{loc.get('row')}:{loc.get('column')}"
+        out.append(f"{where} {d.get('code') or '?'} {d.get('message')}")
+    return "\n".join(out)
+
+
+def _filter_mypy(stdout: str, changed_lines: dict[str, set[int]], cwd: Path) -> list[str]:
+    """Keep only mypy error lines whose location is on a changed line."""
+
+    kept: list[str] = []
+    for line in stdout.splitlines():
+        m = _MYPY_LINE_RE.match(line)
+        if not m:
+            continue
+        rel = _norm_path(m.group("file"), cwd)
+        if _in_scope(rel, int(m.group("line")), changed_lines):
+            kept.append(line)
+    return kept
 
 
 class QualityGates:
-    """Runs lint/typecheck/test scoped to the files a run actually changed."""
+    """Runs lint/typecheck/test scoped to the lines a run actually changed."""
 
     def __init__(self, test_timeout_seconds: int = 600) -> None:
         self._test_timeout = test_timeout_seconds
 
-    async def run(self, cwd: Path, changed_files: list[str]) -> GateSuite:
+    async def run(
+        self,
+        cwd: Path,
+        changed_files: list[str],
+        changed_lines: dict[str, set[int]] | None = None,
+    ) -> GateSuite:
         py_files = _python_targets(cwd, changed_files)
         if not py_files:
             logger.info("gates.skip reason=no_python_changes changed={n}", n=len(changed_files))
             return GateSuite(cwd=cwd, results=[])
+        scope = changed_lines or {}
         logger.info("gates.scope py_files={n}", n=len(py_files))
-        results: list[GateResult] = []
-        for spec in _build_specs(cwd, py_files, self._test_timeout):
-            results.append(await self._run_one(spec, cwd))
+        results = [
+            await self._gate_ruff(cwd, py_files, scope),
+            await self._gate_mypy(cwd, py_files, scope),
+        ]
+        test_targets = _select_test_targets(cwd, py_files)
+        if test_targets:
+            results.append(await self._gate_pytest(cwd, test_targets))
+        else:
+            logger.info("gates.test_skip reason=no_matching_tests files={n}", n=len(py_files))
         return GateSuite(cwd=cwd, results=results)
 
-    async def _run_one(self, spec: GateSpec, cwd: Path) -> GateResult:
-        logger.info("gates.run name={n} cmd={c}", n=spec.name, c=" ".join(spec.command))
+    async def _exec(
+        self, command: tuple[str, ...], cwd: Path, timeout_s: int
+    ) -> tuple[int | None, str, str, float, bool]:
+        logger.info("gates.run cmd={c}", c=" ".join(command))
         started = monotonic()
         proc = await asyncio.create_subprocess_exec(
-            *spec.command,
+            *command,
             cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ},
         )
         timed_out = False
-        stdout_bytes = b""
-        stderr_bytes = b""
+        out_b = err_b = b""
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=spec.timeout_seconds,
-            )
+            out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         except TimeoutError:
             timed_out = True
             proc.kill()
             await proc.wait()
         duration = monotonic() - started
-
-        stdout = stdout_bytes.decode("utf-8", errors="replace")
-        stderr = stderr_bytes.decode("utf-8", errors="replace")
         exit_code = proc.returncode if not timed_out else None
-        passed = not timed_out and exit_code == 0
-
-        logger.info(
-            "gates.done name={n} passed={p} duration={d}s",
-            n=spec.name,
-            p=passed,
-            d=round(duration, 2),
+        return (
+            exit_code,
+            out_b.decode("utf-8", errors="replace"),
+            err_b.decode("utf-8", errors="replace"),
+            duration,
+            timed_out,
         )
+
+    @staticmethod
+    def _skipped(name: str, reason: str, duration: float, stderr: str) -> GateResult:
+        logger.info("gates.skip_tool name={n} reason={r}", n=name, r=reason)
         return GateResult(
-            name=spec.name,
+            name=name,
+            passed=True,
+            skipped=True,
+            skip_reason=reason,
+            duration_seconds=duration,
+            exit_code=None,
+            stdout_tail="",
+            stderr_tail=_tail(stderr, 20),
+        )
+
+    async def _gate_ruff(
+        self, cwd: Path, py_files: list[str], scope: dict[str, set[int]]
+    ) -> GateResult:
+        cmd = ("uv", "run", "--frozen", "ruff", "check", "--output-format=json", *py_files)
+        exit_code, stdout, stderr, duration, timed_out = await self._exec(cmd, cwd, 300)
+        if _SPAWN_FAILURE_MARKER in stderr:
+            return self._skipped("lint", "ruff not available", duration, stderr)
+        try:
+            kept = _filter_ruff(stdout, scope, cwd)
+        except json.JSONDecodeError:
+            # ruff couldn't emit JSON (usage/config error) — surface, don't hide.
+            logger.warning("gates.ruff_bad_output exit={e}", e=exit_code)
+            return GateResult(
+                name="lint",
+                passed=False,
+                duration_seconds=duration,
+                exit_code=exit_code,
+                stdout_tail=_tail(stdout, 40),
+                stderr_tail=_tail(stderr, 40),
+                timed_out=timed_out,
+            )
+        passed = not kept and not timed_out
+        logger.info("gates.done name=lint passed={p} in_scope={k}", p=passed, k=len(kept))
+        return GateResult(
+            name="lint",
             passed=passed,
             duration_seconds=duration,
             exit_code=exit_code,
-            stdout_tail=_tail(stdout, spec.tail_lines),
-            stderr_tail=_tail(stderr, spec.tail_lines),
+            stdout_tail=_tail(_format_ruff(kept), 80),
+            stderr_tail="",
+            timed_out=timed_out,
+        )
+
+    async def _gate_mypy(
+        self, cwd: Path, py_files: list[str], scope: dict[str, set[int]]
+    ) -> GateResult:
+        cmd = ("uv", "run", "--frozen", "mypy", *py_files)
+        exit_code, stdout, stderr, duration, timed_out = await self._exec(cmd, cwd, 300)
+        if _SPAWN_FAILURE_MARKER in stderr or _SPAWN_FAILURE_MARKER in stdout:
+            return self._skipped("typecheck", "mypy not available", duration, stderr)
+        kept = _filter_mypy(stdout, scope, cwd)
+        passed = not kept and not timed_out
+        logger.info("gates.done name=typecheck passed={p} in_scope={k}", p=passed, k=len(kept))
+        return GateResult(
+            name="typecheck",
+            passed=passed,
+            duration_seconds=duration,
+            exit_code=exit_code,
+            stdout_tail=_tail("\n".join(kept), 80),
+            stderr_tail="" if passed else _tail(stderr, 20),
+            timed_out=timed_out,
+        )
+
+    async def _gate_pytest(self, cwd: Path, test_targets: list[str]) -> GateResult:
+        cmd = ("uv", "run", "--frozen", "pytest", "-q", *test_targets)
+        exit_code, stdout, stderr, duration, timed_out = await self._exec(
+            cmd, cwd, self._test_timeout
+        )
+        if _SPAWN_FAILURE_MARKER in stderr:
+            return self._skipped("test", "pytest not available", duration, stderr)
+        passed = not timed_out and exit_code == 0
+        logger.info("gates.done name=test passed={p} duration={d}s", p=passed, d=round(duration, 2))
+        return GateResult(
+            name="test",
+            passed=passed,
+            duration_seconds=duration,
+            exit_code=exit_code,
+            stdout_tail=_tail(stdout, 80),
+            stderr_tail=_tail(stderr, 80),
             timed_out=timed_out,
         )
 

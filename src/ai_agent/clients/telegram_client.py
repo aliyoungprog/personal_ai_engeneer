@@ -1,3 +1,4 @@
+import re
 from html import escape
 
 from aiogram import Bot
@@ -8,6 +9,45 @@ from loguru import logger
 from ai_agent.database.models import Task, TaskRun
 from ai_agent.errors import TelegramError
 from ai_agent.schemas import MRInfo, NotionTaskDTO, TaskChangesDTO
+
+# Telegram hard-caps a message at 4096 chars; leave room for the card chrome.
+_MR_BODY_LIMIT = 3500
+
+
+def _inline_md_to_html(s: str) -> str:
+    """Convert inline markdown (links, code, bold) in an already-escaped string."""
+
+    s = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", r'<a href="\2">\1</a>', s)
+    s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+    return re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", s)
+
+
+def _md_to_tg_html(md: str) -> str:
+    """Render the markdown subset build_mr_description emits as Telegram HTML.
+
+    Headings become bold, list items become bullets, links/code/bold are
+    converted inline. Text is escaped first, then truncated to Telegram's limit.
+    """
+
+    out: list[str] = []
+    for raw in md.splitlines():
+        if raw.strip() == "---":
+            out.append("➖➖➖")
+            continue
+        heading = re.match(r"^#{1,6}\s+(.*)$", raw)
+        if heading:
+            out.append(f"<b>{_inline_md_to_html(escape(heading.group(1)))}</b>")
+            continue
+        bullet = re.match(r"^(\s*)-\s+(.*)$", raw)
+        if bullet:
+            indent = "  " * (len(bullet.group(1)) // 2)
+            out.append(f"{indent}• {_inline_md_to_html(escape(bullet.group(2)))}")
+            continue
+        out.append(_inline_md_to_html(escape(raw)))
+    text = "\n".join(out)
+    if len(text) > _MR_BODY_LIMIT:
+        text = text[:_MR_BODY_LIMIT].rstrip() + "\n…"
+    return text
 
 
 class TelegramClient:
@@ -171,14 +211,16 @@ class TelegramClient:
         except Exception as e:
             raise TelegramError("send_execution_failed failed", details={"error": str(e)}) from e
 
-    async def send_mr_ready(self, task: Task, run: TaskRun, mr: MRInfo) -> None:
+    async def send_mr_ready(
+        self, task: Task, run: TaskRun, mr: MRInfo, description: str | None = None
+    ) -> None:
         tid = f"T-{task.notion_task_id}" if task.notion_task_id else "?"
-        text = (
-            f"✅ <b>{tid} готова к ревью</b>\n"
-            f"📋 {escape(task.title)}\n"
-            f"🔗 <a href=\"{mr.web_url}\">MR !{mr.iid}</a>\n"
-            f"Жми <b>Approve</b> чтобы смержить."
+        head = (
+            f"✅ <b>{tid} готова к ревью</b> — "
+            f"<a href=\"{mr.web_url}\">MR !{mr.iid}</a>"
         )
+        body = f"\n\n{_md_to_tg_html(description)}" if description else f"\n📋 {escape(task.title)}"
+        text = f"{head}{body}\n\nЖми <b>Approve</b> чтобы смержить."
         rid = str(run.id)
         approve_cb = f"mr:approve:{rid}"
         cancel_cb = f"mr:cancel:{rid}"

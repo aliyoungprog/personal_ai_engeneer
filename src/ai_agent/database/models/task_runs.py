@@ -14,6 +14,7 @@ class TaskRunStatus(StrEnum):
     CODING = "coding"                # claude generating code
     TESTING = "testing"              # ruff / mypy / pytest in worktree
     REVIEWING = "reviewing"          # reviewer agent
+    TESTER = "tester"                # QA agent writes + runs tests
     PUSHING = "pushing"              # push branch + create MR
     AWAITING_CI = "awaiting_ci"      # GitLab pipeline pending
     AWAITING_APPROVAL = "awaiting_approval"  # human in Telegram

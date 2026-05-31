@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     # findings are precise and trustworthy, even though opus is heavier on the
     # 5-hour rate limit than sonnet.
     reviewer_model: str = "opus"
+    # Tester (QA) agent: writes + runs tests after review. Sonnet is enough for
+    # mechanical test authoring and keeps the rate-limit budget for the reviewer.
+    tester_model: str = "sonnet"
+    # When true, a QA agent writes + runs tests after the reviewer approves and
+    # before the MR is opened; its failure iterates back to the coder.
+    run_tester: bool = True
 
     # When true the executor stops after REVIEWING (no push / MR / merge).
     execution_dry_run: bool = False
