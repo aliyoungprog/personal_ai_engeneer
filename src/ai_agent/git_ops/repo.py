@@ -38,6 +38,9 @@ class RepoManager:
     async def ensure_cloned(self) -> None:
         if (self._base_path / ".git").exists():
             logger.info("repo.fetch path={p}", p=str(self._base_path))
+            # Keep origin's embedded credential in sync with the configured
+            # token (it may have changed since the initial clone).
+            await run_git("remote", "set-url", "origin", self._authed_url(), cwd=self._base_path)
             await run_git("fetch", "--prune", "origin", cwd=self._base_path)
             return
         logger.info("repo.clone path={p}", p=str(self._base_path))

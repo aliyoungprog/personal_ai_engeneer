@@ -62,6 +62,8 @@ class DIContainer(containers.DeclarativeContainer):
         WorktreeManager,
         repo=repo_manager,
         worktrees_root=providers.Object(Path("/app/worktrees")),
+        author_name=app_settings.provided.git_author_name,
+        author_email=app_settings.provided.git_author_email,
     )
 
     # AI components
@@ -79,6 +81,7 @@ class DIContainer(containers.DeclarativeContainer):
     task_execution_service = providers.Singleton(
         TaskExecutionService,
         task_runs_repository=task_runs_repository,
+        tasks_repository=tasks_repository,
         claude_runner=claude_runner,
         reviewer=reviewer,
         quality_gates=quality_gates,

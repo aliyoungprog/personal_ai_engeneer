@@ -1,5 +1,4 @@
 from ai_agent.gates.check import (
-    DEFAULT_PYTHON_GATES,
     GateResult,
     GateSpec,
     GateSuite,
@@ -7,7 +6,6 @@ from ai_agent.gates.check import (
 )
 
 __all__ = (
-    "DEFAULT_PYTHON_GATES",
     "GateResult",
     "GateSpec",
     "GateSuite",

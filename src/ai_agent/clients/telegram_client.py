@@ -1,7 +1,9 @@
 from html import escape
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from loguru import logger
 
 from ai_agent.database.models import Task, TaskRun
 from ai_agent.errors import TelegramError
@@ -81,6 +83,45 @@ class TelegramClient:
         except Exception as e:
             raise TelegramError("send_task_changed failed", details={"error": str(e)}) from e
 
+    async def send_live(self, text: str) -> int | None:
+        """Send a message meant to be edited in place; return its id.
+
+        Best-effort: live streaming must never abort a run, so failures are
+        swallowed (returns None) rather than raised.
+        """
+
+        try:
+            msg = await self._bot.send_message(
+                chat_id=self._allowed_user_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            return msg.message_id
+        except Exception as e:
+            logger.warning("telegram.send_live_failed err={e}", e=str(e))
+            return None
+
+    async def edit_live(self, message_id: int, text: str) -> None:
+        """Edit a previously sent live message. Best-effort, never raises.
+
+        Telegram raises TelegramBadRequest('message is not modified') when the
+        text is unchanged — that is benign and ignored.
+        """
+
+        try:
+            await self._bot.edit_message_text(
+                chat_id=self._allowed_user_id,
+                message_id=message_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except TelegramBadRequest:
+            pass
+        except Exception as e:
+            logger.warning("telegram.edit_live_failed err={e}", e=str(e))
+
     async def send_execution_progress(self, task: Task, run: TaskRun, line: str) -> None:
         tid = f"T-{task.notion_task_id}" if task.notion_task_id else "?"
         text = f"⚙️ <b>{tid}</b> {escape(line)}"
@@ -94,19 +135,37 @@ class TelegramClient:
         except Exception as e:
             raise TelegramError("send_execution_progress failed", details={"error": str(e)}) from e
 
-    async def send_execution_failed(self, task: Task, run: TaskRun, reason: str) -> None:
+    async def send_execution_failed(
+        self, task: Task, run: TaskRun, reason: str, *, transient: bool = False
+    ) -> None:
         tid = f"T-{task.notion_task_id}" if task.notion_task_id else "?"
-        text = (
-            f"❌ <b>{tid} провалилась</b>\n"
-            f"📋 {escape(task.title)}\n"
-            f"Этап: <code>{escape(run.status)}</code>\n"
-            f"<pre>{escape(reason[:600])}</pre>"
+        lines = [
+            f"❌ <b>{tid} провалилась</b>",
+            f"📋 {escape(task.title)}",
+            f"Этап: <code>{escape(run.status)}</code>",
+        ]
+        if transient:
+            lines.append(
+                "🌐 Похоже, нет доступа к репозиторию (VPN?). Задача возвращена в "
+                "очередь — пришлю свежую карточку, когда источник будет доступен."
+            )
+        lines.append(f"<pre>{escape(reason[:600])}</pre>")
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🔁 Повторить",
+                        callback_data=f"task:accept:{task.notion_page_id}",
+                    )
+                ]
+            ]
         )
         try:
             await self._bot.send_message(
                 chat_id=self._allowed_user_id,
-                text=text,
+                text="\n".join(lines),
                 parse_mode="HTML",
+                reply_markup=kb,
                 disable_web_page_preview=True,
             )
         except Exception as e:

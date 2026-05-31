@@ -22,7 +22,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Claude Code CLI (uses host OAuth from /home/agent/.claude — see compose volume)
 RUN npm install -g @anthropic-ai/claude-code
 
-COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /usr/local/bin/uv
+# uv must match the version that generated the lockfiles (this project's and
+# any target repo the agent edits). 0.5.11 wrote an OLDER lockfile format and
+# silently rewrote new-format locks (stripping `revision`/`upload-time`) on any
+# `uv` command, producing thousands of lines of noise in agent MRs. 0.11.x is
+# the host/repo version and emits the same format the locks already use.
+#
+# Installed from PyPI rather than `COPY --from=ghcr.io/astral-sh/uv` because the
+# colima docker daemon pulls ghcr layers extremely slowly here; the daemon's
+# PyPI path is fast (it is what `uv sync` below uses).
+RUN pip install --no-cache-dir uv==0.11.7
 
 RUN groupadd --gid 1000 agent && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash agent
 

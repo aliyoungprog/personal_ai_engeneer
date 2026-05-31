@@ -74,24 +74,76 @@ class GateSuite(BaseModel):
         return "\n".join(lines)
 
 
-DEFAULT_PYTHON_GATES: tuple[GateSpec, ...] = (
-    GateSpec(name="lint", command=("uv", "run", "ruff", "check", ".")),
-    GateSpec(name="typecheck", command=("uv", "run", "mypy", ".")),
-    GateSpec(name="test", command=("uv", "run", "pytest", "-q"), timeout_seconds=600),
-)
+def _is_test_file(p: Path) -> bool:
+    return p.name.startswith("test_") or p.name.endswith("_test.py") or "tests" in p.parts
+
+
+def _python_targets(cwd: Path, changed_files: list[str]) -> list[str]:
+    """Changed .py files that still exist in the worktree (skip deletions)."""
+
+    return [f for f in changed_files if f.endswith(".py") and (cwd / f).is_file()]
+
+
+def _select_test_targets(cwd: Path, py_files: list[str]) -> list[str]:
+    """Map changed .py files to the tests worth running.
+
+    A changed test file runs itself; a changed source file pulls in tests named
+    `test_<stem>.py` / `<stem>_test.py` anywhere in the tree. Best-effort: if a
+    source change has no discoverable test, it simply contributes none.
+    """
+
+    targets: set[str] = set()
+    for f in py_files:
+        p = Path(f)
+        if _is_test_file(p):
+            targets.add(f)
+            continue
+        for m in [*cwd.glob(f"**/test_{p.stem}.py"), *cwd.glob(f"**/{p.stem}_test.py")]:
+            if ".git" not in m.parts:
+                targets.add(str(m.relative_to(cwd)))
+    return sorted(targets)
+
+
+def _build_specs(cwd: Path, py_files: list[str], test_timeout: int) -> list[GateSpec]:
+    """Lint/typecheck the changed files only; test their matching tests only.
+
+    `uv run --frozen` syncs the env from the existing lockfile WITHOUT rewriting
+    it — so gates never introduce uv.lock churn.
+    """
+
+    specs = [
+        GateSpec(name="lint", command=("uv", "run", "--frozen", "ruff", "check", *py_files)),
+        GateSpec(name="typecheck", command=("uv", "run", "--frozen", "mypy", *py_files)),
+    ]
+    test_targets = _select_test_targets(cwd, py_files)
+    if test_targets:
+        specs.append(
+            GateSpec(
+                name="test",
+                command=("uv", "run", "--frozen", "pytest", "-q", *test_targets),
+                timeout_seconds=test_timeout,
+            )
+        )
+    else:
+        logger.info("gates.test_skip reason=no_matching_tests files={n}", n=len(py_files))
+    return specs
 
 
 class QualityGates:
-    """Runs a fixed sequence of GateSpec commands against a worktree."""
+    """Runs lint/typecheck/test scoped to the files a run actually changed."""
 
-    def __init__(self, gates: tuple[GateSpec, ...] = DEFAULT_PYTHON_GATES) -> None:
-        self._gates = gates
+    def __init__(self, test_timeout_seconds: int = 600) -> None:
+        self._test_timeout = test_timeout_seconds
 
-    async def run(self, cwd: Path) -> GateSuite:
+    async def run(self, cwd: Path, changed_files: list[str]) -> GateSuite:
+        py_files = _python_targets(cwd, changed_files)
+        if not py_files:
+            logger.info("gates.skip reason=no_python_changes changed={n}", n=len(changed_files))
+            return GateSuite(cwd=cwd, results=[])
+        logger.info("gates.scope py_files={n}", n=len(py_files))
         results: list[GateResult] = []
-        for spec in self._gates:
-            result = await self._run_one(spec, cwd)
-            results.append(result)
+        for spec in _build_specs(cwd, py_files, self._test_timeout):
+            results.append(await self._run_one(spec, cwd))
         return GateSuite(cwd=cwd, results=results)
 
     async def _run_one(self, spec: GateSpec, cwd: Path) -> GateResult:

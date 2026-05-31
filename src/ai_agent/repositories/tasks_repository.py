@@ -60,7 +60,9 @@ class TasksRepository(BaseRepo[Task]):
             decision=TaskDecision.PENDING.value,
             notified_at__not_isnull=True,
         ).values_list("notion_page_id", flat=True)
-        return set(rows)
+        # flat=True yields a flat list of str at runtime; the stub types it as
+        # tuples, so normalise explicitly to satisfy the set[str] return type.
+        return {str(page_id) for page_id in rows}
 
     async def mark_notified(self, notion_page_id: str) -> None:
         await Task.filter(notion_page_id=notion_page_id).update(notified_at=datetime.now(UTC))
@@ -69,6 +71,19 @@ class TasksRepository(BaseRepo[Task]):
         await Task.filter(notion_page_id=notion_page_id).update(
             decision=decision.value,
             decided_at=datetime.now(UTC),
+        )
+
+    async def reset_for_retry(self, notion_page_id: str) -> None:
+        """Put a task back into the pending queue after a transient failure.
+
+        Clearing `notified_at` makes the poller re-send a fresh task card on its
+        next tick, so the user can re-accept once the blocker (e.g. VPN) is gone.
+        """
+
+        await Task.filter(notion_page_id=notion_page_id).update(
+            decision=TaskDecision.PENDING.value,
+            decided_at=None,
+            notified_at=None,
         )
 
     async def list_by_decision(self, decision: TaskDecision) -> list[Task]:

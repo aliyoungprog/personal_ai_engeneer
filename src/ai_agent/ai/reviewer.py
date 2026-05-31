@@ -13,22 +13,36 @@ from typing import Literal
 from loguru import logger
 from pydantic import BaseModel, ValidationError
 
-from ai_agent.ai.claude_runner import ClaudeRunner, ClaudeRunRequest
+from ai_agent.ai.claude_runner import ClaudeRunner, ClaudeRunRequest, EventCallback
 from ai_agent.errors import AgentError
 
 REVIEWER_SYSTEM_PROMPT = """\
-You are a strict senior software engineer doing a code review.
+You are a very strong, precise senior software engineer doing a rigorous code
+review. The engineer whose diff you review will act on your verdict literally
+and address EVERY item you raise — so be correct, specific, and actionable, and
+never invent busywork. If the change is genuinely clean, approve it.
 
-Rules:
-- You have READ-ONLY access. You may read files with Read/Glob/Grep but
-  must NOT propose fixes or modify anything.
+Process:
+- You have READ-ONLY access. Use Read/Glob/Grep to actually open the changed
+  files and their neighbours, trace the logic, and check edge cases. Verify your
+  claims against the real code — do not guess from the diff alone. You must NOT
+  modify anything or propose patches; you describe the required change.
 - Judge the diff against these criteria:
-  1. Correctness — bugs, off-by-one, race conditions, wrong logic.
-  2. Scope — does the change touch only what the task asks? Flag unrelated edits.
-  3. Tests — are new tests present where they should be?
-  4. Project conventions — does the diff follow the repo's CLAUDE.md / AGENTS.md
-     and existing code style?
-  5. Safety — secrets/PII leaks, destructive operations, blocking calls in async.
+  1. Correctness — bugs, off-by-one, wrong logic, races, unhandled errors,
+     broken edge cases. Reason through the actual control flow.
+  2. Scope — the change must touch ONLY what the task asks. Treat as scope creep
+     (and block): unrelated edits, and especially adding/upgrading dependencies,
+     tooling, lockfile (uv.lock) churn, or tool config (e.g. [tool.mypy]) to make
+     a check pass. A failing gate must be fixed in the source, not by changing
+     tooling.
+  3. Tests — new or changed logic must have matching tests.
+  4. Conventions — follow the repo's CLAUDE.md / AGENTS.md and existing style.
+  5. Safety — secrets/PII leaks, destructive ops, blocking calls in async code.
+
+Every item you raise MUST be precise and actionable: name the exact file, the
+line range, what is wrong, and the concrete minimal change required. Vague notes
+like "consider improving X" are not allowed — either it is a specific change the
+engineer must make, or it is not an item.
 
 Reply with EXACTLY one JSON object on the LAST line of your message, nothing
 after it. No code fences around it. Shape (formatted here for readability,
@@ -37,13 +51,20 @@ emit it on a single line):
 {
   "verdict": "approve" | "request_changes" | "comment",
   "summary": "<one sentence>",
-  "blocking_issues": [{"file": "<path>", "lines": "<range or ?>", "issue": "<concise>"}],
-  "non_blocking":    [{"file": "<path>", "issue": "<concise>"}]
+  "blocking_issues": [{"file": "<path>", "lines": "<range>", "issue": "<exact change>"}],
+  "non_blocking":    [{"file": "<path>", "issue": "<exact change>"}]
 }
 
-- "approve": change is correct, scoped, complete.
-- "request_changes": real bugs OR scope creep OR missing tests for new logic.
-- "comment": acceptable but you have non-blocking suggestions.
+Verdict discipline:
+- "approve": correct, in-scope, complete, idiomatic — nothing for the engineer
+  to change. Use this whenever there is no actionable item.
+- "request_changes": at least one blocking defect — a bug, scope creep (incl.
+  unrelated dependency/tooling/lockfile/config changes), a security/PII issue, or
+  missing tests for new logic. List each under blocking_issues.
+- "comment": the change is shippable, but you have specific, actionable
+  improvements the engineer must apply. List each under non_blocking. Do not use
+  "comment" for vague or purely subjective musings — if there is nothing concrete
+  to change, approve instead.
 """
 
 
@@ -64,6 +85,9 @@ class ReviewVerdict(BaseModel):
 
     @property
     def is_approved(self) -> bool:
+        # Only an explicit "approve" ends the loop. Both "request_changes" and
+        # "comment" send the diff back to the coder, who must address every
+        # reviewer item precisely before the MR is opened.
         return self.verdict == "approve"
 
     def feedback_for_claude(self) -> str:
@@ -106,6 +130,7 @@ class ReviewerAgent:
         diff_text: str,
         task_brief: str,
         timeout_seconds: int = 600,
+        on_event: EventCallback | None = None,
     ) -> ReviewVerdict:
         prompt = self._build_prompt(task_brief, diff_text)
         result = await self._runner.run(
@@ -118,7 +143,8 @@ class ReviewerAgent:
                 disallowed_tools=self.DENIED_TOOLS,
                 permission_mode="default",
                 timeout_seconds=timeout_seconds,
-            )
+            ),
+            on_event=on_event,
         )
         if not result.success or not result.final_message:
             raise AgentError(
@@ -177,4 +203,4 @@ def _extract_last_json(text: str) -> str | None:
     matches = _JSON_OBJECT_RE.findall(text)
     if not matches:
         return None
-    return matches[-1]
+    return str(matches[-1])

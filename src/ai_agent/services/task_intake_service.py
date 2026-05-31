@@ -38,14 +38,20 @@ class TaskIntakeService:
                 url=dto.url,
             )
 
+            # Notify for any pending task not yet notified. Covers brand-new
+            # tasks AND tasks re-queued for retry after a transient failure
+            # (reset_for_retry clears notified_at) — the row already exists then,
+            # so a 'previous is None'-only check would miss the re-offer.
+            if task.notified_at is None and task.decision == TaskDecision.PENDING.value:
+                logger.info("task.notify page_id={pid} title={t}", pid=dto.page_id, t=dto.title)
+                try:
+                    await self._tg.send_new_task_card(dto)
+                    await self._tasks.mark_notified(dto.page_id)
+                except Exception:
+                    logger.exception("telegram.notify_failed page_id={pid}", pid=dto.page_id)
+                continue
+
             if previous is None:
-                if task.notified_at is None and task.decision == TaskDecision.PENDING.value:
-                    logger.info("task.notify page_id={pid} title={t}", pid=dto.page_id, t=dto.title)
-                    try:
-                        await self._tg.send_new_task_card(dto)
-                        await self._tasks.mark_notified(dto.page_id)
-                    except Exception:
-                        logger.exception("telegram.notify_failed page_id={pid}", pid=dto.page_id)
                 continue
 
             changes = _diff(

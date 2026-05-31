@@ -34,9 +34,17 @@ class WorktreeHandle(BaseModel):
 class WorktreeManager:
     """Creates and tears down per-task git worktrees on top of a base clone."""
 
-    def __init__(self, repo: RepoManager, worktrees_root: Path) -> None:
+    def __init__(
+        self,
+        repo: RepoManager,
+        worktrees_root: Path,
+        author_name: str = "",
+        author_email: str = "",
+    ) -> None:
         self._repo = repo
         self._root = worktrees_root
+        self._author_name = author_name
+        self._author_email = author_email
 
     async def create(self, slug: str) -> WorktreeHandle:
         path = self._root / slug
@@ -67,6 +75,12 @@ class WorktreeManager:
             base_ref,
             cwd=self._repo.path,
         )
+        # Attribute the agent's commits to the human owner (GitLab links commits
+        # to accounts by email), overriding any default identity.
+        if self._author_name:
+            await run_git("config", "user.name", self._author_name, cwd=path)
+        if self._author_email:
+            await run_git("config", "user.email", self._author_email, cwd=path)
         return WorktreeHandle(slug=slug, branch=branch, path=path)
 
     async def remove(self, slug: str, *, delete_branch: bool = True) -> None:
@@ -113,6 +127,35 @@ class WorktreeManager:
             f"origin/{self._repo.default_branch}...HEAD",
             cwd=handle.path,
         )
+
+    async def changed_files(self, handle: WorktreeHandle) -> list[str]:
+        """Repo-relative paths changed on this branch vs the base, committed."""
+
+        out = await run_git(
+            "diff",
+            "--name-only",
+            f"origin/{self._repo.default_branch}...HEAD",
+            cwd=handle.path,
+        )
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
+    async def revert_file_to_base(
+        self, handle: WorktreeHandle, rel_path: str, *, message: str
+    ) -> bool:
+        """Restore one file to its base version and commit, if it differs.
+
+        Used to drop unintended churn (e.g. a tool regenerating uv.lock) from a
+        branch. Returns True if a revert commit was made.
+        """
+
+        base = f"origin/{self._repo.default_branch}"
+        await run_git("checkout", base, "--", rel_path, cwd=handle.path)
+        status = await run_git("status", "--porcelain", "--", rel_path, cwd=handle.path)
+        if not status.strip():
+            return False
+        await run_git("commit", "-m", message, "--", rel_path, cwd=handle.path)
+        logger.info("worktree.reverted slug={s} path={p}", s=handle.slug, p=rel_path)
+        return True
 
     async def head_commit(self, handle: WorktreeHandle) -> str:
         return (await run_git("rev-parse", "HEAD", cwd=handle.path)).strip()

@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import tempfile
+import threading
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from time import monotonic
@@ -121,6 +123,12 @@ def _parse_events(
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 
+async def _relay(callback: EventCallback, event: dict[str, Any]) -> None:
+    """Wrap an event callback in a coroutine for run_coroutine_threadsafe."""
+
+    await callback(event)
+
+
 class ClaudeRunner:
     """Run the Claude Code CLI as an async subprocess and capture stream-json output."""
 
@@ -137,19 +145,27 @@ class ClaudeRunner:
 
         argv = self._build_argv(request)
         logger.info(
-            "claude.run.start cwd={c} argc={n} tools_allow={a} tools_deny={d}",
+            "claude.run.start cwd={c} argc={n} tools_allow={a} tools_deny={d} stream={s}",
             c=str(request.cwd),
             n=len(argv),
             a=len(request.allowed_tools),
             d=len(request.disallowed_tools),
+            s=on_event is not None,
         )
-        # NOTE: claude (a Node process) is spawned via a SYNCHRONOUS subprocess
-        # inside a worker thread, NOT asyncio.create_subprocess_exec. On colima
-        # (vz, macOS) the asyncio subprocess transport reliably SIGKILLs the
-        # node child at ~20-30s; a plain subprocess survives. on_event real-time
-        # streaming is therefore not available (the orchestrator emits its own
-        # stage-level progress instead).
-        return await asyncio.to_thread(self._run_blocking, argv, request)
+        # NOTE: claude is spawned via a SYNCHRONOUS subprocess inside a worker
+        # thread, NOT asyncio.create_subprocess_exec. On colima (vz, macOS) the
+        # asyncio subprocess transport reliably SIGKILLs the child at ~20-30s;
+        # a plain subprocess survives.
+        #
+        # When on_event is provided we read stdout line-by-line (each line is a
+        # stream-json event) and bridge each event back onto the running event
+        # loop via run_coroutine_threadsafe, so the orchestrator can stream the
+        # coder's activity to Telegram in real time. Without on_event we use the
+        # simpler buffered path that parses everything after completion.
+        if on_event is None:
+            return await asyncio.to_thread(self._run_blocking, argv, request)
+        loop = asyncio.get_running_loop()
+        return await asyncio.to_thread(self._run_streaming, argv, request, on_event, loop)
 
     def _run_blocking(self, argv: list[str], request: ClaudeRunRequest) -> ClaudeRunResult:
         # subprocess.run (via communicate) reads stdout+stderr concurrently and
@@ -180,8 +196,103 @@ class ClaudeRunner:
 
         duration = monotonic() - started
         stderr_text = stderr_bytes.decode("utf-8", errors="replace")
-
         events, result_event, last_rate_limit = _parse_events(stdout_bytes)
+        return self._finalize(
+            request, events, result_event, last_rate_limit, duration, exit_code, stderr_text,
+            timed_out=timed_out,
+        )
+
+    def _run_streaming(
+        self,
+        argv: list[str],
+        request: ClaudeRunRequest,
+        on_event: EventCallback,
+        loop: asyncio.AbstractEventLoop,
+    ) -> ClaudeRunResult:
+        # Like _run_blocking, but reads stdout incrementally so each stream-json
+        # event can be forwarded to on_event (which runs on `loop`) as it lands.
+        # stderr is drained to a temp file to avoid a full-pipe deadlock, and a
+        # watchdog timer enforces the hard timeout (iterating proc.stdout has no
+        # native timeout).
+        started = monotonic()
+        events: list[dict[str, Any]] = []
+        result_event: dict[str, Any] | None = None
+        last_rate_limit: dict[str, Any] | None = None
+        timed_out = threading.Event()
+
+        with tempfile.TemporaryFile() as stderr_f:
+            proc = subprocess.Popen(  # noqa: S603 — argv built internally
+                argv,
+                cwd=str(request.cwd),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=stderr_f,
+            )
+
+            def _kill_on_timeout() -> None:
+                timed_out.set()
+                logger.warning("claude.run.timeout cwd={c}", c=str(request.cwd))
+                proc.kill()
+
+            watchdog = threading.Timer(request.timeout_seconds, _kill_on_timeout)
+            watchdog.start()
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.write(request.prompt.encode("utf-8"))
+                    proc.stdin.close()
+                assert proc.stdout is not None
+                # readline() (not `for line in stdout`) delivers each event as
+                # soon as it is flushed; iteration buffers with read-ahead and
+                # would stall real-time streaming.
+                while True:
+                    raw = proc.stdout.readline()
+                    if not raw:
+                        break
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    events.append(event)
+                    etype = event.get("type")
+                    if etype == "result":
+                        result_event = event
+                    elif etype == "rate_limit_event":
+                        last_rate_limit = event.get("rate_limit_info", {})
+                    # Bridge onto the loop; fire-and-forget, the consumer
+                    # throttles. Never let a callback error kill the read loop.
+                    try:
+                        asyncio.run_coroutine_threadsafe(_relay(on_event, event), loop)
+                    except RuntimeError:
+                        pass
+                proc.wait()
+            finally:
+                watchdog.cancel()
+            exit_code = proc.returncode
+            stderr_f.seek(0)
+            stderr_text = stderr_f.read().decode("utf-8", errors="replace")
+
+        duration = monotonic() - started
+        return self._finalize(
+            request, events, result_event, last_rate_limit, duration,
+            None if timed_out.is_set() else exit_code, stderr_text,
+            timed_out=timed_out.is_set(),
+        )
+
+    def _finalize(
+        self,
+        request: ClaudeRunRequest,
+        events: list[dict[str, Any]],
+        result_event: dict[str, Any] | None,
+        last_rate_limit: dict[str, Any] | None,
+        duration: float,
+        exit_code: int | None,
+        stderr_text: str,
+        *,
+        timed_out: bool,
+    ) -> ClaudeRunResult:
         resets_at = last_rate_limit.get("resetsAt") if last_rate_limit else None
         blocking_rl = last_rate_limit is not None and _rate_limit_blocking(last_rate_limit)
 
@@ -252,6 +363,12 @@ class ClaudeRunner:
             "--output-format",
             "stream-json",
             "--verbose",
+            # Ignore any .mcp.json shipped inside the target repo (e.g. a
+            # postgres MCP pointing at localhost:6432). Without this, Claude
+            # Code auto-loads the cloned repo's MCP config and hangs on the
+            # unreachable server during init. The agent uses its own
+            # allowed-tools, not the repo's MCP servers.
+            "--strict-mcp-config",
             "--permission-mode",
             request.permission_mode,
         ]

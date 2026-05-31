@@ -1,5 +1,6 @@
 import asyncio
 import signal
+from collections.abc import Awaitable, Callable
 
 from loguru import logger
 
@@ -12,6 +13,44 @@ from ai_agent.dependencies import (
 )
 from ai_agent.settings import settings
 from ai_agent.utils.logging import configure_logging
+
+
+async def _supervise(
+    name: str,
+    factory: Callable[[], Awaitable[None]],
+    stop_event: asyncio.Event,
+    *,
+    base_delay: float = 2.0,
+    max_delay: float = 30.0,
+) -> None:
+    """Keep a long-running coroutine alive across transient failures.
+
+    A network blip in the Telegram long-poll (or the Notion poller) used to end
+    the task and, via FIRST_COMPLETED, tear down the whole agent. Here we instead
+    restart it with capped exponential backoff until shutdown is requested.
+    """
+
+    delay = base_delay
+    while not stop_event.is_set():
+        started = asyncio.get_running_loop().time()
+        try:
+            await factory()
+            logger.warning("supervise.exited name={n} — restarting", n=name)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("supervise.crashed name={n}", n=name)
+        if stop_event.is_set():
+            break
+        # Reset backoff if it ran healthily for a while before failing.
+        if asyncio.get_running_loop().time() - started > 60:
+            delay = base_delay
+        logger.info("supervise.restart name={n} in={d}s", n=name, d=delay)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+        except TimeoutError:
+            pass
+        delay = min(delay * 2, max_delay)
 
 
 async def run() -> None:
@@ -39,8 +78,12 @@ async def run() -> None:
         except NotImplementedError:
             pass
 
-    bot_task = asyncio.create_task(telegram.start(), name="telegram")
-    poll_task = asyncio.create_task(poller.start(), name="poller")
+    bot_task = asyncio.create_task(
+        _supervise("telegram", telegram.start, stop_event), name="telegram"
+    )
+    poll_task = asyncio.create_task(
+        _supervise("poller", poller.start, stop_event), name="poller"
+    )
     stop_task = asyncio.create_task(stop_event.wait(), name="stop")
 
     _done, pending = await asyncio.wait(
