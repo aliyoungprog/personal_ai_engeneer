@@ -46,6 +46,10 @@ from ai_agent.settings import settings
 
 _TOOL_ICONS = {"Edit": "✏️", "Write": "📝", "MultiEdit": "✏️", "Read": "👁", "Bash": "$"}
 
+# Stop re-queuing a task after this many consecutive transient failures, so a
+# persistent outage (e.g. VPN down for hours) doesn't spin an infinite loop.
+_MAX_TRANSIENT_REQUEUES = 5
+
 # Substrings that mark a failure as transient/infrastructure (network, VPN, DNS)
 # rather than a real coding problem — these are safe to auto-retry.
 _TRANSIENT_MARKERS = (
@@ -179,6 +183,12 @@ class TaskExecutionService:
         self._notion = notion_client
         self._dry_run = dry_run
         self._lock = asyncio.Lock()
+        # Hold strong refs to fire-and-forget run tasks so the event loop does
+        # not garbage-collect them mid-run; discarded when they finish.
+        self._inflight: set[asyncio.Task[None]] = set()
+        # Per-task count of transient (infrastructure) re-queues, to stop an
+        # unbounded retry loop when e.g. the VPN is down indefinitely.
+        self._requeues: dict[str, int] = {}
 
     @property
     def is_busy(self) -> bool:
@@ -202,16 +212,21 @@ class TaskExecutionService:
     async def start(self, task: Task) -> None:
         """Kick off execution as a background task (fire-and-forget)."""
 
-        asyncio.create_task(
+        run_task = asyncio.create_task(
             self._run_safe(task),
             name=f"exec-{task.notion_page_id[:8]}",
         )
+        # Keep a strong reference until completion (asyncio only holds a weak one).
+        self._inflight.add(run_task)
+        run_task.add_done_callback(self._inflight.discard)
 
     async def _run_safe(self, task: Task) -> None:
         async with self._lock:
             run = await self._task_runs.create_for_task(task)
             try:
                 await self._execute(run, task)
+                # Clean state ⇒ this task's transient-failure streak resets.
+                self._requeues.pop(task.notion_page_id, None)
             except AgentError as e:
                 transient = _is_transient_failure(e)
                 logger.error(
@@ -222,11 +237,25 @@ class TaskExecutionService:
                     d=e.details,
                 )
                 await self._task_runs.mark_failed(run, str(e))
+                await self._cleanup_failed_worktree(run)
                 await self._handle_failure(task, run, f"{e}: {e.details}", transient=transient)
             except Exception as e:
                 logger.exception("execution.crashed page={p}", p=task.notion_page_id)
                 await self._task_runs.mark_failed(run, repr(e))
+                await self._cleanup_failed_worktree(run)
                 await self._handle_failure(task, run, repr(e), transient=False)
+
+    async def _cleanup_failed_worktree(self, run: TaskRun) -> None:
+        """Remove the worktree + local branch left by a failed run (best-effort).
+
+        Without this every failed task leaks its on-disk worktree and a dangling
+        ai-agent/<slug> branch, growing unbounded over an unattended lifetime.
+        """
+
+        try:
+            await self._cleanup_worktree(run)
+        except Exception:
+            logger.warning("execution.cleanup_failed run={r}", r=str(run.id))
 
     async def _handle_failure(
         self, task: Task, run: TaskRun, reason: str, *, transient: bool
@@ -235,10 +264,26 @@ class TaskExecutionService:
         # git host) is not the task's fault: roll the decision back to PENDING
         # and clear the notification so the poller re-offers it once connectivity
         # returns. Real failures (coder/gates/reviewer) stay failed but still get
-        # a manual retry button.
+        # a manual retry button. Cap consecutive transient re-queues so a
+        # persistent outage doesn't spin an infinite retry loop.
         if transient:
-            await self._tasks.reset_for_retry(task.notion_page_id)
-            logger.info("execution.retry_queued page={p}", p=task.notion_page_id)
+            count = self._requeues.get(task.notion_page_id, 0) + 1
+            self._requeues[task.notion_page_id] = count
+            if count <= _MAX_TRANSIENT_REQUEUES:
+                await self._tasks.reset_for_retry(task.notion_page_id)
+                logger.info(
+                    "execution.retry_queued page={p} attempt={n}/{m}",
+                    p=task.notion_page_id,
+                    n=count,
+                    m=_MAX_TRANSIENT_REQUEUES,
+                )
+            else:
+                transient = False  # exhausted → report as a real failure, stop looping
+                logger.warning(
+                    "execution.retry_exhausted page={p} after={m}",
+                    p=task.notion_page_id,
+                    m=_MAX_TRANSIENT_REQUEUES,
+                )
         try:
             await self._tg.send_execution_failed(task, run, reason, transient=transient)
         except Exception:
@@ -493,7 +538,10 @@ class TaskExecutionService:
         # 5) PUSHING — push branch + open MR
         await self._set_status(run, TaskRunStatus.PUSHING)
         await self._notify(task, run, "пушу ветку и открываю MR")
-        await self._worktree.push(handle)
+        # force-with-lease: the ai-agent/<slug> branch is disposable and owned by
+        # the agent, so a re-run can safely overwrite a stale remote branch left
+        # by a prior attempt (otherwise the push fails non-fast-forward).
+        await self._worktree.push(handle, force_with_lease=True)
         # The tester may have committed test files after `changed` was last
         # computed — refresh so the MR description lists them too.
         changed = await self._worktree.changed_files(handle)

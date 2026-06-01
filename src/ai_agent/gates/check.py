@@ -312,6 +312,10 @@ class QualityGates:
         )
         if _SPAWN_FAILURE_MARKER in stderr:
             return self._skipped("test", "pytest not available", duration, stderr)
+        # pytest exit 5 = "no tests collected": the selected targets contained no
+        # tests (not a failure). Don't block the run on it.
+        if exit_code == 5:
+            return self._skipped("test", "no tests collected", duration, stdout)
         passed = not timed_out and exit_code == 0
         logger.info("gates.done name=test passed={p} duration={d}s", p=passed, d=round(duration, 2))
         return GateResult(

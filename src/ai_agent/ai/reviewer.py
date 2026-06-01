@@ -6,7 +6,6 @@ Read-only — no Edit/Write/Bash allowed. Returns a structured verdict.
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Literal
 
@@ -200,13 +199,36 @@ class ReviewerAgent:
             ) from e
 
 
-_JSON_OBJECT_RE = re.compile(r"\{(?:[^{}]|(?:\{[^{}]*\}))*\}", re.DOTALL)
-
-
 def _extract_last_json(text: str) -> str | None:
-    """Find the last JSON object substring in text. Tolerates extra prose."""
+    """Return the last top-level {...} object in text.
 
-    matches = _JSON_OBJECT_RE.findall(text)
-    if not matches:
-        return None
-    return str(matches[-1])
+    Brace-balanced scan that ignores braces inside string literals (and escapes),
+    so a verdict whose string values or trailing prose contain '{' or '}' is
+    parsed correctly — unlike a regex, which mis-counted those.
+    """
+
+    best: str | None = None
+    depth = 0
+    start = -1
+    in_str = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                best = text[start : i + 1]
+    return best

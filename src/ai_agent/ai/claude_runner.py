@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import subprocess
 import tempfile
 import threading
@@ -129,6 +131,22 @@ async def _relay(callback: EventCallback, event: dict[str, Any]) -> None:
     await callback(event)
 
 
+def _kill_process_group(proc: subprocess.Popen[bytes]) -> None:
+    """SIGKILL the whole process group so claude's child git/node/pytest also die.
+
+    proc is launched with start_new_session=True, so it leads its own group;
+    killing the group reaps grandchildren that a plain proc.kill() would orphan.
+    """
+
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
 class ClaudeRunner:
     """Run the Claude Code CLI as an async subprocess and capture stream-json output."""
 
@@ -219,6 +237,7 @@ class ClaudeRunner:
         result_event: dict[str, Any] | None = None
         last_rate_limit: dict[str, Any] | None = None
         timed_out = threading.Event()
+        stalled = threading.Event()
 
         with tempfile.TemporaryFile() as stderr_f:
             proc = subprocess.Popen(  # noqa: S603 — argv built internally
@@ -227,15 +246,31 @@ class ClaudeRunner:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=stderr_f,
+                start_new_session=True,
             )
 
-            def _kill_on_timeout() -> None:
+            def _on_hard_timeout() -> None:
                 timed_out.set()
                 logger.warning("claude.run.timeout cwd={c}", c=str(request.cwd))
-                proc.kill()
+                _kill_process_group(proc)
 
-            watchdog = threading.Timer(request.timeout_seconds, _kill_on_timeout)
+            def _on_inactivity() -> None:
+                stalled.set()
+                logger.warning(
+                    "claude.run.stalled cwd={c} idle_s={s}",
+                    c=str(request.cwd),
+                    s=request.inactivity_timeout_seconds,
+                )
+                _kill_process_group(proc)
+
+            watchdog = threading.Timer(request.timeout_seconds, _on_hard_timeout)
             watchdog.start()
+            # Inactivity watchdog: reset on every event. If no stream-json event
+            # arrives for inactivity_timeout_seconds the CLI is assumed wedged
+            # (e.g. silently waiting on a rate-limit window) and is killed,
+            # instead of blocking the whole queue for the full hard timeout.
+            inactivity = threading.Timer(request.inactivity_timeout_seconds, _on_inactivity)
+            inactivity.start()
             try:
                 if proc.stdin is not None:
                     proc.stdin.write(request.prompt.encode("utf-8"))
@@ -248,6 +283,13 @@ class ClaudeRunner:
                     raw = proc.stdout.readline()
                     if not raw:
                         break
+                    # Liveness: a line arrived, so the CLI isn't wedged — reset
+                    # the inactivity watchdog.
+                    inactivity.cancel()
+                    inactivity = threading.Timer(
+                        request.inactivity_timeout_seconds, _on_inactivity
+                    )
+                    inactivity.start()
                     line = raw.decode("utf-8", errors="replace").strip()
                     if not line:
                         continue
@@ -270,15 +312,17 @@ class ClaudeRunner:
                 proc.wait()
             finally:
                 watchdog.cancel()
+                inactivity.cancel()
             exit_code = proc.returncode
             stderr_f.seek(0)
             stderr_text = stderr_f.read().decode("utf-8", errors="replace")
 
         duration = monotonic() - started
+        wedged = timed_out.is_set() or stalled.is_set()
         return self._finalize(
             request, events, result_event, last_rate_limit, duration,
-            None if timed_out.is_set() else exit_code, stderr_text,
-            timed_out=timed_out.is_set(),
+            None if wedged else exit_code, stderr_text,
+            timed_out=wedged,
         )
 
     def _finalize(

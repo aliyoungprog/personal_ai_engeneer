@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -43,12 +44,25 @@ def parse_changed_lines(diff_text: str) -> dict[str, set[int]]:
 
 
 def make_branch_slug(task_id: int | None, title: str, max_len: int = 60) -> str:
-    """Turn a task title into a safe git ref slug like 'T-456-add-metrics'."""
+    """Turn a task title into a safe, unique, valid git ref slug.
+
+    Handles titles that sanitise to nothing (e.g. all-Cyrillic/emoji) by falling
+    back to a stable hash so distinct tasks never collide on the slug 'task', and
+    strips the components git forbids in refnames ('..', leading/trailing '.'/'-',
+    a trailing '.lock').
+    """
 
     prefix = f"T-{task_id}-" if task_id else ""
-    sanitized = _SLUG_RE.sub("-", title.lower()).strip("-")
-    sanitized = re.sub(r"-+", "-", sanitized)
-    body = sanitized[: max_len - len(prefix)] or "task"
+    sanitized = _SLUG_RE.sub("-", title.lower())
+    sanitized = re.sub(r"-+", "-", sanitized).replace("..", "-")
+    body = sanitized[: max_len - len(prefix)].strip("-._")
+    if body.endswith(".lock"):
+        body = body[: -len(".lock")].strip("-._")
+    if not body:
+        # No ASCII-safe content — derive a stable per-title suffix so distinct
+        # tasks get distinct branches/worktrees instead of all collapsing to one.
+        digest = hashlib.sha1(title.encode("utf-8"), usedforsecurity=False).hexdigest()
+        body = f"task-{digest[:8]}"
     return f"{prefix}{body}".strip("-")
 
 

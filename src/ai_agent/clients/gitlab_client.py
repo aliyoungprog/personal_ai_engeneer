@@ -82,10 +82,14 @@ class GitLabClient:
             project = self._get_project()
             try:
                 mr = project.mergerequests.get(iid)
+                # The project requires the pipeline to pass before merge. Use
+                # merge-when-pipeline-succeeds so an in-flight pipeline schedules
+                # the merge instead of failing with 405; merges immediately when
+                # the pipeline is already green or absent.
                 mr.merge(
                     should_remove_source_branch=True,
                     squash=squash,
-                    merge_when_pipeline_succeeds=False,
+                    merge_when_pipeline_succeeds=True,
                 )
                 mr = project.mergerequests.get(iid)
             except GitlabError as e:
