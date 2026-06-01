@@ -260,6 +260,25 @@ class TelegramClient:
         except Exception as e:
             raise TelegramError("send_execution_failed failed", details={"error": str(e)}) from e
 
+    async def send_run_controls(self, task: Task, run: TaskRun) -> None:
+        """Send a persistent ❌ Cancel control for an in-flight run."""
+
+        tid = f"T-{task.notion_task_id}" if task.notion_task_id else "?"
+        cancel_btn = InlineKeyboardButton(
+            text="❌ Отменить прогон", callback_data=f"mr:cancel:{run.id}"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[[cancel_btn]])
+        try:
+            await self._bot.send_message(
+                chat_id=self._allowed_user_id,
+                text=f"🟢 <b>{tid}</b> запущена — {escape(task.title[:60])}",
+                parse_mode="HTML",
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            raise TelegramError("send_run_controls failed", details={"error": str(e)}) from e
+
     async def send_mr_ready(
         self, task: Task, run: TaskRun, mr: MRInfo, description: str | None = None
     ) -> None:

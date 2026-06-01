@@ -22,7 +22,7 @@ from ai_agent.ai.claude_runner import ClaudeRunResult
 from ai_agent.errors import AgentError
 from ai_agent.gates import GateResult, GateSuite
 from ai_agent.git_ops.worktree import WorktreeHandle
-from ai_agent.services.task_execution_service import TaskExecutionService
+from ai_agent.services.task_execution_service import TaskExecutionService, _RunControl
 from ai_agent.settings import settings
 
 
@@ -168,6 +168,8 @@ def _build_service(
     tg = MagicMock()
     tg.send_execution_progress = AsyncMock()
     tg.send_mr_ready = AsyncMock()
+    tg.send_run_controls = AsyncMock()
+    tg.send_run_finished = AsyncMock()
 
     service = TaskExecutionService(
         task_runs_repository=task_runs,
@@ -207,7 +209,7 @@ async def test_single_pass_when_first_attempt_clean(
         verdicts=[_approve()],
     )
 
-    await service._execute(run, task)
+    await service._execute(run, task, _RunControl())
 
     assert claude.run.call_count == 1
     assert review.call_count == 1
@@ -225,7 +227,7 @@ async def test_comment_verdict_drives_an_iteration(task: Any, run: Any) -> None:
         verdicts=[_comment(), _approve()],
     )
 
-    await service._execute(run, task)
+    await service._execute(run, task, _RunControl())
 
     assert claude.run.call_count == 2
     assert review.call_count == 2
@@ -243,7 +245,7 @@ async def test_reviewer_feedback_drives_a_second_coder_pass(
         verdicts=[_request_changes(), _approve()],
     )
 
-    await service._execute(run, task)
+    await service._execute(run, task, _RunControl())
 
     assert claude.run.call_count == 2
     assert review.call_count == 2
@@ -264,7 +266,7 @@ async def test_gate_failure_drives_a_second_coder_pass(
         verdicts=[_approve()],
     )
 
-    await service._execute(run, task)
+    await service._execute(run, task, _RunControl())
 
     assert claude.run.call_count == 2
     # The reviewer only runs once — after the gates finally pass.
@@ -284,7 +286,7 @@ async def test_fails_after_max_iterations_when_reviewer_never_approves(
     )
 
     with pytest.raises(AgentError, match="reviewer requested changes after 2 iteration"):
-        await service._execute(run, task)
+        await service._execute(run, task, _RunControl())
 
     assert claude.run.call_count == 2
     assert review.call_count == 2
@@ -300,7 +302,7 @@ async def test_tester_failure_drives_a_second_coder_pass(task: Any, run: Any) ->
         tester_verdicts=[_tester_fail(), _tester_pass()],
     )
 
-    await service._execute(run, task)
+    await service._execute(run, task, _RunControl())
 
     assert claude.run.call_count == 2
     assert review.call_count == 2
@@ -322,7 +324,7 @@ async def test_tester_failure_after_max_iterations_fails_run(
     )
 
     with pytest.raises(AgentError, match="QA tests failed after 2 iteration"):
-        await service._execute(run, task)
+        await service._execute(run, task, _RunControl())
 
     assert claude.run.call_count == 2
     assert cast(AsyncMock, service._tester.test).call_count == 2

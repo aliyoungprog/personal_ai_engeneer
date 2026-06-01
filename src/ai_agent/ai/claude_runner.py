@@ -123,6 +123,9 @@ def _parse_events(
 
 
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
+# Called (from the worker thread) with the live Popen right after spawn, so the
+# orchestrator can kill it to abort an in-flight run. Called with None on exit.
+SpawnCallback = Callable[[subprocess.Popen[bytes] | None], None]
 
 
 async def _relay(callback: EventCallback, event: dict[str, Any]) -> None:
@@ -157,6 +160,7 @@ class ClaudeRunner:
         self,
         request: ClaudeRunRequest,
         on_event: EventCallback | None = None,
+        on_spawn: SpawnCallback | None = None,
     ) -> ClaudeRunResult:
         if not request.cwd.is_dir():
             raise ValueError(f"cwd does not exist: {request.cwd}")
@@ -183,7 +187,9 @@ class ClaudeRunner:
         if on_event is None:
             return await asyncio.to_thread(self._run_blocking, argv, request)
         loop = asyncio.get_running_loop()
-        return await asyncio.to_thread(self._run_streaming, argv, request, on_event, loop)
+        return await asyncio.to_thread(
+            self._run_streaming, argv, request, on_event, loop, on_spawn
+        )
 
     def _run_blocking(self, argv: list[str], request: ClaudeRunRequest) -> ClaudeRunResult:
         # subprocess.run (via communicate) reads stdout+stderr concurrently and
@@ -226,6 +232,7 @@ class ClaudeRunner:
         request: ClaudeRunRequest,
         on_event: EventCallback,
         loop: asyncio.AbstractEventLoop,
+        on_spawn: SpawnCallback | None = None,
     ) -> ClaudeRunResult:
         # Like _run_blocking, but reads stdout incrementally so each stream-json
         # event can be forwarded to on_event (which runs on `loop`) as it lands.
@@ -248,6 +255,8 @@ class ClaudeRunner:
                 stderr=stderr_f,
                 start_new_session=True,
             )
+            if on_spawn is not None:
+                on_spawn(proc)
 
             def _on_hard_timeout() -> None:
                 timed_out.set()
@@ -313,6 +322,8 @@ class ClaudeRunner:
             finally:
                 watchdog.cancel()
                 inactivity.cancel()
+                if on_spawn is not None:
+                    on_spawn(None)
             exit_code = proc.returncode
             stderr_f.seek(0)
             stderr_text = stderr_f.read().decode("utf-8", errors="replace")

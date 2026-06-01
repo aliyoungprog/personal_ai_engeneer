@@ -12,7 +12,12 @@ from typing import Literal
 from loguru import logger
 from pydantic import BaseModel, ValidationError
 
-from ai_agent.ai.claude_runner import ClaudeRunner, ClaudeRunRequest, EventCallback
+from ai_agent.ai.claude_runner import (
+    ClaudeRunner,
+    ClaudeRunRequest,
+    EventCallback,
+    SpawnCallback,
+)
 from ai_agent.errors import AgentError
 
 REVIEWER_SYSTEM_PROMPT = """\
@@ -136,6 +141,7 @@ class ReviewerAgent:
         task_brief: str,
         timeout_seconds: int = 600,
         on_event: EventCallback | None = None,
+        on_spawn: SpawnCallback | None = None,
     ) -> ReviewVerdict:
         prompt = self._build_prompt(task_brief, diff_text)
         result = await self._runner.run(
@@ -150,6 +156,7 @@ class ReviewerAgent:
                 timeout_seconds=timeout_seconds,
             ),
             on_event=on_event,
+            on_spawn=on_spawn,
         )
         if not result.success or not result.final_message:
             raise AgentError(

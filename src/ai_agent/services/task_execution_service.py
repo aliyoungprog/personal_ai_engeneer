@@ -14,6 +14,7 @@ AWAITING_APPROVAL → MERGING transition is triggered by a Telegram /approve.
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from collections import deque
 from html import escape
 from time import monotonic
@@ -29,6 +30,7 @@ from ai_agent.ai import (
     ReviewVerdict,
     TesterAgent,
 )
+from ai_agent.ai.claude_runner import _kill_process_group
 from ai_agent.clients import GitLabClient, NotionClient, TelegramClient
 from ai_agent.database.models import Task, TaskRun, TaskRunStatus
 from ai_agent.errors import AgentError, NotFoundError
@@ -49,6 +51,32 @@ _TOOL_ICONS = {"Edit": "✏️", "Write": "📝", "MultiEdit": "✏️", "Read":
 # Stop re-queuing a task after this many consecutive transient failures, so a
 # persistent outage (e.g. VPN down for hours) doesn't spin an infinite loop.
 _MAX_TRANSIENT_REQUEUES = 5
+
+
+class _RunControl:
+    """Abort handle for one in-flight run.
+
+    Holds the run's asyncio task and the currently-live claude subprocess (set
+    by ClaudeRunner via on_spawn). abort() kills the subprocess group — which
+    unblocks the coder/reviewer/tester pass — and cancels the task so any other
+    await (gates, git) unwinds too. `cancelled` lets _run_safe report the run as
+    CANCELLED rather than FAILED.
+    """
+
+    def __init__(self) -> None:
+        self.cancelled = False
+        self.task: asyncio.Task[None] | None = None
+        self._proc: subprocess.Popen[bytes] | None = None
+
+    def set_proc(self, proc: subprocess.Popen[bytes] | None) -> None:
+        self._proc = proc
+
+    def abort(self) -> None:
+        self.cancelled = True
+        if self._proc is not None:
+            _kill_process_group(self._proc)
+        if self.task is not None:
+            self.task.cancel()
 
 # Substrings that mark a failure as transient/infrastructure (network, VPN, DNS)
 # rather than a real coding problem — these are safe to auto-retry.
@@ -189,6 +217,9 @@ class TaskExecutionService:
         # Per-task count of transient (infrastructure) re-queues, to stop an
         # unbounded retry loop when e.g. the VPN is down indefinitely.
         self._requeues: dict[str, int] = {}
+        # Abort handles for runs currently executing, keyed by run id, so a
+        # Telegram Cancel can stop an in-flight run (not just an awaiting MR).
+        self._active: dict[UUID, _RunControl] = {}
 
     @property
     def is_busy(self) -> bool:
@@ -212,22 +243,33 @@ class TaskExecutionService:
     async def start(self, task: Task) -> None:
         """Kick off execution as a background task (fire-and-forget)."""
 
+        control = _RunControl()
         run_task = asyncio.create_task(
-            self._run_safe(task),
+            self._run_safe(task, control),
             name=f"exec-{task.notion_page_id[:8]}",
         )
+        control.task = run_task
         # Keep a strong reference until completion (asyncio only holds a weak one).
         self._inflight.add(run_task)
         run_task.add_done_callback(self._inflight.discard)
 
-    async def _run_safe(self, task: Task) -> None:
+    async def _run_safe(self, task: Task, control: _RunControl) -> None:
         async with self._lock:
             run = await self._task_runs.create_for_task(task)
+            self._active[run.id] = control
             try:
-                await self._execute(run, task)
+                await self._execute(run, task, control)
                 # Clean state ⇒ this task's transient-failure streak resets.
                 self._requeues.pop(task.notion_page_id, None)
+            except asyncio.CancelledError:
+                logger.info("execution.cancelled page={p}", p=task.notion_page_id)
+                await self._finalize_cancelled(task, run)
+                # Handled — do not re-raise; the run ends in CANCELLED.
             except AgentError as e:
+                if control.cancelled:
+                    logger.info("execution.cancelled page={p} (via abort)", p=task.notion_page_id)
+                    await self._finalize_cancelled(task, run)
+                    return
                 transient = _is_transient_failure(e)
                 logger.error(
                     "execution.failed page={p} stage={s} transient={t} detail={d}",
@@ -240,10 +282,25 @@ class TaskExecutionService:
                 await self._cleanup_failed_worktree(run)
                 await self._handle_failure(task, run, f"{e}: {e.details}", transient=transient)
             except Exception as e:
+                if control.cancelled:
+                    await self._finalize_cancelled(task, run)
+                    return
                 logger.exception("execution.crashed page={p}", p=task.notion_page_id)
                 await self._task_runs.mark_failed(run, repr(e))
                 await self._cleanup_failed_worktree(run)
                 await self._handle_failure(task, run, repr(e), transient=False)
+            finally:
+                self._active.pop(run.id, None)
+
+    async def _finalize_cancelled(self, task: Task, run: TaskRun) -> None:
+        """Mark a cancelled run, clean its worktree, and notify."""
+
+        await self._task_runs.set_status(run, TaskRunStatus.CANCELLED)
+        await self._cleanup_failed_worktree(run)
+        try:
+            await self._tg.send_run_finished(task, run, mr_url=run.mr_url, succeeded=False)
+        except Exception:
+            logger.warning("execution.cancel_notify_failed page={p}", p=task.notion_page_id)
 
     async def _cleanup_failed_worktree(self, run: TaskRun) -> None:
         """Remove the worktree + local branch left by a failed run (best-effort).
@@ -304,10 +361,15 @@ class TaskExecutionService:
             logger.info("execution.lockfile_reverted run={r}", r=str(run.id))
             await self._task_runs.append_event(run, {"stage": "lockfile_revert", "file": "uv.lock"})
 
-    async def _execute(self, run: TaskRun, task: Task) -> None:
+    async def _execute(self, run: TaskRun, task: Task, control: _RunControl) -> None:
         # 1) PREPARING — clone+worktree
         await self._set_status(run, TaskRunStatus.PREPARING)
         await self._notify(task, run, "готовлю worktree")
+        # Offer a ❌ Cancel button for the whole in-flight run.
+        try:
+            await self._tg.send_run_controls(task, run)
+        except Exception:
+            logger.warning("execution.controls_failed page={p}", p=task.notion_page_id)
         await self._repo.ensure_cloned()
         slug = make_branch_slug(task.notion_task_id, task.title)
         handle = await self._worktree.create(slug)
@@ -350,6 +412,7 @@ class TaskExecutionService:
                     timeout_seconds=1800,
                 ),
                 on_event=stream,
+                on_spawn=control.set_proc,
             )
             if stream is not None:
                 ok = "✅ кодинг завершён" if coding.success else "⚠️ кодинг не удался"
@@ -434,6 +497,7 @@ class TaskExecutionService:
                 diff_text=diff,
                 task_brief=task_brief,
                 on_event=review_stream,
+                on_spawn=control.set_proc,
             )
             if review_stream is not None:
                 await review_stream.finalize(f"🔍 вердикт: {verdict.verdict}")
@@ -487,6 +551,7 @@ class TaskExecutionService:
                     diff_text=diff,
                     task_brief=task_brief,
                     on_event=test_stream,
+                    on_spawn=control.set_proc,
                 )
                 if test_stream is not None:
                     await test_stream.finalize(f"🧪 вердикт: {test_verdict.verdict}")
@@ -596,6 +661,16 @@ class TaskExecutionService:
             await self._tg.send_execution_failed(task, run, repr(e))
 
     async def cancel(self, run_id: UUID) -> None:
+        # In-flight run: abort it (kill the live claude process + cancel the
+        # task). _run_safe then finalizes it as CANCELLED and cleans up — we must
+        # NOT touch its worktree here or we'd race the still-unwinding _execute.
+        control = self._active.get(run_id)
+        if control is not None:
+            logger.info("execution.cancel_inflight run={r}", r=str(run_id))
+            control.abort()
+            return
+
+        # Finished run (e.g. AWAITING_APPROVAL): no live execution to race.
         run = await self._task_runs.get_or_none(id=run_id)
         if run is None:
             raise NotFoundError(details={"run_id": str(run_id)})
