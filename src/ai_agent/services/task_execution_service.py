@@ -270,6 +270,11 @@ class TaskExecutionService:
 
         # 2-4) CODING → TESTING → REVIEWING, iterating on feedback.
         body = await self._notion.fetch_page_body(task.notion_page_id)
+        # Reviewer and tester judge completeness against the FULL task (title +
+        # description), not just the title — otherwise they approve plausible
+        # but incomplete fixes (e.g. a Makefile guard for a "remove hardcoded
+        # secret" task).
+        task_brief = f"{task.title}\n\n{body.strip()}" if body.strip() else task.title
         max_iters = settings.max_iterations
         feedback: str | None = None  # set once a pass needs fixes; drives the next coder pass
         gate_suite: GateSuite | None = None
@@ -382,7 +387,7 @@ class TaskExecutionService:
             verdict = await self._reviewer.review(
                 worktree_path=handle.path,
                 diff_text=diff,
-                task_brief=task.title,
+                task_brief=task_brief,
                 on_event=review_stream,
             )
             if review_stream is not None:
@@ -435,7 +440,7 @@ class TaskExecutionService:
                 test_verdict = await self._tester.test(
                     worktree_path=handle.path,
                     diff_text=diff,
-                    task_brief=task.title,
+                    task_brief=task_brief,
                     on_event=test_stream,
                 )
                 if test_stream is not None:

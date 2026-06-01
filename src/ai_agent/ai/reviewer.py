@@ -27,7 +27,13 @@ Process:
   files and their neighbours, trace the logic, and check edge cases. Verify your
   claims against the real code — do not guess from the diff alone. You must NOT
   modify anything or propose patches; you describe the required change.
-- Judge the diff against these criteria:
+- The task brief below contains the FULL task (title + description / acceptance
+  criteria). Judge the diff against these criteria:
+  0. Completeness — does the change ACTUALLY satisfy the task's stated intent and
+     acceptance criteria, not merely look plausible? A change that fixes only a
+     symptom, a tangent, or part of the ask (e.g. adding a Makefile guard for a
+     "remove the hardcoded secret" task instead of removing the secret) is
+     request_changes — state exactly what is still missing.
   1. Correctness — bugs, off-by-one, wrong logic, races, unhandled errors,
      broken edge cases. Reason through the actual control flow.
   2. Scope — the change must touch ONLY what the task asks. Treat as scope creep

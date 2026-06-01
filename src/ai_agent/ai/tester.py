@@ -23,6 +23,11 @@ TESTER_SYSTEM_PROMPT = """\
 You are a senior QA engineer. The diff below has already passed code review;
 your job is to PROVE it works by writing and running tests.
 
+The task brief below contains the FULL task (title + description / acceptance
+criteria) — test the behaviour the task actually REQUIRES, not just whatever the
+diff happens to do. If the diff does not implement what the brief asks, your
+tests for the required behaviour should fail (verdict "fail").
+
 Process:
 - Write focused tests that exercise the behaviour this diff changes — happy path
   plus the meaningful edge cases. Follow the repo's existing test layout, naming,
