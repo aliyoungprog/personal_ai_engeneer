@@ -33,6 +33,9 @@ Process:
 - Run your tests with `uv run --frozen pytest <your test files>`. Use
   `uv run --frozen ...` so the environment is never re-locked; do not run
   `uv lock`/`uv sync` or edit `uv.lock`.
+- Keep your tests lint-clean. A targeted inline `# noqa: <CODE>` on one line is
+  fine for a spurious rule (e.g. `SLF001` when mocking a private member, `S101`
+  for asserts); never blanket-disable rules or edit ruff config.
 - The target app may need services (DB/Redis/etc.) that are not available here.
   If you genuinely cannot run a test in isolation, prefer unit-level tests with
   mocks. If nothing can be run, set "ran": false and explain why.

@@ -56,13 +56,19 @@ class Settings(BaseSettings):
     # before the MR is opened; its failure iterates back to the coder.
     run_tester: bool = True
 
+    # Autonomy: when true the poller auto-accepts pending tasks instead of
+    # waiting for a Telegram ▶️ Взять — one per poll while no run is in flight,
+    # so the agent works the backlog unattended. The final MR merge still
+    # requires a human /approve (auto-accept, manual merge).
+    auto_accept: bool = False
+
     # When true the executor stops after REVIEWING (no push / MR / merge).
     execution_dry_run: bool = False
 
     # Max coder passes per run. The first pass is the initial implementation;
     # each subsequent pass feeds gate/reviewer feedback back to the coder to fix.
     # The run fails only if gates/reviewer are still unhappy after this many passes.
-    max_iterations: int = Field(default=3, ge=1)
+    max_iterations: int = Field(default=7, ge=1)
 
     # Stream the coder's live activity (file edits, commands, short thoughts)
     # into a single, throttled Telegram message during the CODING stage.

@@ -180,6 +180,17 @@ class TaskExecutionService:
         self._dry_run = dry_run
         self._lock = asyncio.Lock()
 
+    @property
+    def is_busy(self) -> bool:
+        """True while a run holds the execution lock (coding…tester).
+
+        The lock is released once a run reaches AWAITING_APPROVAL, so a run
+        waiting on a human /approve does not count as busy — the agent is free
+        to pick up the next task while finished MRs queue for merge.
+        """
+
+        return self._lock.locked()
+
     async def _notify(self, task: Task, run: TaskRun, line: str) -> None:
         """Best-effort progress ping; a Telegram outage must not abort a run."""
 

@@ -72,21 +72,36 @@ def register_handlers(
             return
 
         per_group_limit = 20
-        lines: list[str] = [f"📋 <b>Tasks ({total}):</b>"]
+        # Pending tasks are sent as actionable cards so any of them can be taken
+        # on demand (▶️ Взять), not just the one auto-offered when first seen.
+        pending = groups["pending"]
+        if pending:
+            await msg.answer(
+                f"📋 <b>Pending — {len(pending)}</b> — жми ▶️ Взять на нужной:",
+                parse_mode="HTML",
+            )
+            for t in pending[:per_group_limit]:
+                await tg.send_pending_task_card(t)
+            if len(pending) > per_group_limit:
+                await msg.answer(f"…и ещё {len(pending) - per_group_limit} pending")
+
+        # The remaining groups are a read-only summary.
+        lines: list[str] = []
         for decision_value, label in group_order:
+            if decision_value == "pending":
+                continue
             items = groups[decision_value]
             if not items:
                 continue
-            lines.append("")
             lines.append(f"<b>{label} — {len(items)}</b>")
             for t in items[:per_group_limit]:
                 tid = f"T-{t.notion_task_id}" if t.notion_task_id else "?"
-                lines.append(
-                    f"• <b>{tid}</b> [{escape(t.status or '?')}] {escape(t.title)}"
-                )
+                lines.append(f"• <b>{tid}</b> [{escape(t.status or '?')}] {escape(t.title)}")
             if len(items) > per_group_limit:
                 lines.append(f"  …и ещё {len(items) - per_group_limit}")
-        await msg.answer("\n".join(lines), parse_mode="HTML")
+            lines.append("")
+        if lines:
+            await msg.answer("\n".join(["📊 <b>Остальные:</b>", *lines]), parse_mode="HTML")
 
     @dp.callback_query(F.data.startswith("task:"))
     async def on_decision(cb: CallbackQuery) -> None:

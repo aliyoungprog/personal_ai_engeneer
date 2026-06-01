@@ -103,6 +103,55 @@ class TelegramClient:
         except Exception as e:
             raise TelegramError("send_new_task_card failed", details={"error": str(e)}) from e
 
+    async def send_auto_taken(self, task: NotionTaskDTO) -> None:
+        """Notify that the agent auto-accepted a task (autonomous mode)."""
+
+        tid = f"T-{task.task_id}" if task.task_id else "?"
+        text = (
+            f"🤖 <b>Авто-взял {tid}</b> в работу\n"
+            f"📋 {escape(task.title)}\n"
+            f'🔗 <a href="{task.url}">открыть в Notion</a>'
+        )
+        try:
+            await self._bot.send_message(
+                chat_id=self._allowed_user_id,
+                text=text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            raise TelegramError("send_auto_taken failed", details={"error": str(e)}) from e
+
+    async def send_pending_task_card(self, task: Task) -> None:
+        """Actionable card for a pending task (used by /list to take on demand)."""
+
+        tid = f"T-{task.notion_task_id}" if task.notion_task_id else "?"
+        text = (
+            f"📋 <b>{tid}</b> {escape(task.title)}\n"
+            f"🏷 {escape(task.project or '?')} · {escape(task.status or '?')}\n"
+            f'🔗 <a href="{task.url}">открыть в Notion</a>'
+        )
+        pid = task.notion_page_id
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="▶️ Взять", callback_data=f"task:accept:{pid}"),
+                    InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"task:skip:{pid}"),
+                    InlineKeyboardButton(text="⏰ Позже", callback_data=f"task:defer:{pid}"),
+                ]
+            ]
+        )
+        try:
+            await self._bot.send_message(
+                chat_id=self._allowed_user_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            raise TelegramError("send_pending_task_card failed", details={"error": str(e)}) from e
+
     async def send_task_changed(self, task: NotionTaskDTO, changes: TaskChangesDTO) -> None:
         tid = f"T-{task.task_id}" if task.task_id else "?"
         labels = {"title": "Title", "status": "Status", "project": "Project"}

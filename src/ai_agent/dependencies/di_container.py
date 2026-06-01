@@ -107,6 +107,8 @@ class DIContainer(containers.DeclarativeContainer):
         TaskIntakeService,
         tasks_repository=tasks_repository,
         telegram_client=telegram_client,
+        decision_service=task_decision_service,
+        execution_service=task_execution_service,
     )
 
     # Interfaces
